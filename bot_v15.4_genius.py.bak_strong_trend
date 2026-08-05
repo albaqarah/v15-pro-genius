@@ -1,0 +1,2397 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+================================================================================
+ BINANCE FUTURES PRO SCALPER V15.4 "GENIUS DIRECTIONAL"
+ Industrial Hybrid Multi-Agentic Quant Trading Engine
+================================================================================
+ Aliansi 3 AI Agent:
+   AGENT 1  Llama 3.1 8B (Flash) -> Master Macro Regime (kompas, 15 menit)
+   AGENT 2  DeepSeek V4 Flash    -> Sentiment & Funding Squeeze Filter
+   AGENT 3  Llama 3.3 70B        -> Supreme Veto Judge (Order Book)
+
+ V15.3 BUG-FIX RELEASE (4 bug yang kamu laporkan):
+   BUG 1  Tidak ada batas re-entry per pair   -> PositionRegistry + cooldown
+   BUG 2  Tidak ada cap posisi live           -> MAX_OPEN_POSITIONS (default 6)
+   BUG 3  Notif Telegram tidak ada WIN/LOSS   -> TradeJournal + watcher TP/SL
+   BUG 4  Notif terkirim tapi tidak ter-entry -> notif dikirim SETELAH order fill
+                                                 (execute-then-notify) + retry
+ Bonus fix teknis:
+   * URL Telegram: https://api.telegram.org/bot<TOKEN>/sendMessage
+   * OpenRouter base_url: https://openrouter.ai/api/v1
+   * EvoMap endpoint: /v1/chat/completions
+   * res.choices[0].message.content (bukan res.choices.message)
+   * if __name__ == "__main__"  (bukan `if name == "main"`)
+   * Semua except polos diganti except Exception + logging
+================================================================================
+"""
+
+import os
+import sys
+import json
+import math
+import signal
+import asyncio
+import time
+import logging
+import traceback
+from collections import deque
+from datetime import datetime, timedelta, timezone
+
+import numpy as np
+import pandas as pd
+import httpx
+import ccxt.pro as ccxtpro
+from dotenv import load_dotenv
+
+try:
+    from openai import OpenAI
+except Exception:  # openai opsional (AI layer bisa dimatikan)
+    OpenAI = None
+
+load_dotenv()
+
+# ==============================================================================
+# 0. UTIL ENV
+# ==============================================================================
+
+
+def env_str(key: str, default: str = "") -> str:
+    raw = os.environ.get(key, default)
+    if raw is None:
+        return ""
+    return raw.strip().strip('"').strip("'").strip()
+
+
+def env_bool(key: str, default: bool = True) -> bool:
+    return env_str(key, "TRUE" if default else "FALSE").upper() in ("TRUE", "1", "YES", "ON")
+
+
+def env_float(key: str, default: float) -> float:
+    try:
+        return float(env_str(key, str(default)))
+    except Exception:
+        return default
+
+
+def env_int(key: str, default: int) -> int:
+    try:
+        return int(float(env_str(key, str(default))))
+    except Exception:
+        return default
+
+
+# ==============================================================================
+# 1. KONFIGURASI
+# ==============================================================================
+
+WIB = timezone(timedelta(hours=7))
+
+# --- 40 pair crypto (Binance USDⓈ-M Futures) ---
+CRYPTO_PAIRS = [
+    'BTC/USDT', 'ETH/USDT', 'BNB/USDT', 'SOL/USDT', 'XRP/USDT',
+    'DOGE/USDT', 'ADA/USDT', 'AVAX/USDT', 'LINK/USDT', 'TRX/USDT',
+    'TON/USDT', 'DOT/USDT', 'LTC/USDT', 'BCH/USDT', 'NEAR/USDT',
+    'APT/USDT', 'ARB/USDT', 'OP/USDT', 'ATOM/USDT', 'FIL/USDT',
+    'INJ/USDT', 'SUI/USDT', 'SEI/USDT', 'TIA/USDT', 'WLD/USDT',
+    'ORDI/USDT', 'ENA/USDT', 'WIF/USDT', '1000PEPE/USDT:USDT', 'ONDO/USDT',
+    'HYPE/USDT', 'JUP/USDT', 'RUNE/USDT', 'AAVE/USDT', 'UNI/USDT',
+    'FET/USDT', 'GALA/USDT', 'CRV/USDT', 'LDO/USDT', 'PAXG/USDT',
+]
+
+# --- 3 pair logam TradFi ---
+TRADFI_DEFAULT_PAIRS = ['XAU/USDT', 'XAG/USDT', 'XPT/USDT']
+
+ASSET_PAIRS = CRYPTO_PAIRS + TRADFI_DEFAULT_PAIRS
+_custom_pairs = env_str("ASSET_PAIRS", "")
+if _custom_pairs:
+    ASSET_PAIRS = [p.strip().upper() for p in _custom_pairs.split(",") if p.strip()]
+
+# Kalau pair ditulis beda nama di bursa (mis. XAU/USDT:USDT), bot mencari
+# padanannya otomatis saat boot. FALSE = pair yang tidak ketemu tetap dicoba.
+AUTO_RESOLVE_PAIRS = env_bool("AUTO_RESOLVE_PAIRS", True)
+
+# --- Mode & eksekusi ---
+DRY_RUN_MODE = env_bool("DRY_RUN_MODE", True)
+TESTNET = env_bool("BINANCE_TESTNET", False)
+LEVERAGE = env_int("LEVERAGE", 20)
+# Margin per trade. MARGIN_AUTO=TRUE -> ikut % saldo LIVE (bukan patokan tetap).
+MARGIN_AUTO = env_bool("MARGIN_AUTO", True)
+MARGIN_PCT_OF_EQUITY = env_float("MARGIN_PCT_OF_EQUITY", 0.10)   # 10% ekuitas / trade
+MARGIN_MIN_USDT = env_float("MARGIN_MIN_USDT", 5.0)              # batas bawah bursa
+MARGIN_MAX_USDT = env_float("MARGIN_MAX_USDT", 0.0)              # 0 = tanpa batas atas
+# --- NOTIONAL CAP (V15.4) ---
+NOTIONAL_LIMIT_USDT = env_float("NOTIONAL_LIMIT_USD", 35.0)
+MARGIN_USDT = env_float("MARGIN_PER_TRADE_USDT", 5.0)            # dipakai kalau MARGIN_AUTO=FALSE
+SCAN_INTERVAL = env_float("SCAN_INTERVAL_SEC", 5.0)   # 43 pair -> beri nafas rate limit
+TIMEFRAME = env_str("TIMEFRAME", "5m")
+TIMEFRAME_TREND = env_str("TIMEFRAME_TREND", "15m")
+
+# --- BUG FIX 1 & 2: manajemen risiko posisi ---
+MAX_OPEN_POSITIONS = env_int("MAX_OPEN_POSITIONS", 6)          # cap global slot posisi
+MAX_POSITION_PER_PAIR = env_int("MAX_POSITION_PER_PAIR", 1)     # anti double entry
+REENTRY_COOLDOWN_SEC = env_int("REENTRY_COOLDOWN_SEC", 900)     # jeda setelah close
+MAX_REENTRY_PER_PAIR_DAY = env_int("MAX_REENTRY_PER_PAIR_DAY", 0)   # 0 / negatif = UNLIMITED
+SIGNAL_DEDUP_SEC = env_int("SIGNAL_DEDUP_SEC", 60)              # anti spam sinyal
+REENTRY_LIMIT_TXT = "\u221e" if MAX_REENTRY_PER_PAIR_DAY <= 0 else str(MAX_REENTRY_PER_PAIR_DAY)
+
+# --- Sensor / radar ---
+ATR_MULTIPLIER = env_float("ATR_MULTIPLIER", 0.8)
+STOCH_OB = env_float("STOCH_OVERBOUGHT", 90.0)
+STOCH_OS = env_float("STOCH_OVERSOLD", 10.0)
+STOCH_PERIOD = env_int("STOCH_PERIOD", 7)
+STOCH_SMOOTH_K = env_int("STOCH_SMOOTH_K", 3)
+STOCH_SMOOTH_D = env_int("STOCH_SMOOTH_D", 3)
+# --- Hyper-Aggressive RSI 5 ---
+RSI_PERIOD = env_int("RSI_PERIOD", 7)
+RSI_OB = env_float("RSI_OVERBOUGHT", 80.0)
+RSI_OS = env_float("RSI_OVERSOLD", 20.0)
+
+ATR_PERIOD = env_int("ATR_PERIOD", 14)
+
+# --- TP / SL / Breakeven ---
+TP_PCT = env_float("TP_PCT", 0.005)           # 0.50% KOTOR (bersih ~0.40% setelah fee)
+SL_ATR_MULT = env_float("SL_ATR_MULT", 0.8)   # SL lebih ketat -> RR sehat
+BREAKEVEN_TRIGGER_PCT = env_float("BREAKEVEN_TRIGGER_PCT", 0.0025)
+BREAKEVEN_OFFSET_PCT = env_float("BREAKEVEN_OFFSET_PCT", 0.0015)  # WAJIB > fee bolak-balik
+MAX_TRADE_AGE_SEC = env_int("MAX_TRADE_AGE_SEC", 3600)
+
+# --- FEE & EKUITAS (dipakai untuk PnL bersih + peringatan setelan merugi) ---
+FEE_TAKER_PCT = env_float("FEE_TAKER_PCT", 0.0005)   # 0.05% per sisi; 0.00045 kalau bayar fee pakai BNB
+FEE_ROUNDTRIP_PCT = FEE_TAKER_PCT * 2                # biaya buka + tutup
+TP_NET_PCT = TP_PCT - FEE_ROUNDTRIP_PCT              # profit riil per win
+# Ekuitas dibaca LIVE dari Binance. Angka di bawah cuma cadangan kalau saldo
+# belum bisa dibaca (mis. dry-run tanpa API key).
+EQUITY_FALLBACK_USDT = env_float("EQUITY_FALLBACK_USDT", 40.0)
+EQUITY_REFRESH_SEC = env_int("EQUITY_REFRESH_SEC", 60)
+EQUITY_SAFETY_PCT = env_float("EQUITY_SAFETY_PCT", 0.90)   # pakai maks 90% ekuitas
+
+# --- AI layer ---
+AI_LAYER_ENABLED = env_bool("AI_LAYER_ENABLED", True)
+AI_FAIL_OPEN = env_bool("AI_FAIL_OPEN", False)   # False = kalau AI error -> batal (aman)
+OPENROUTER_BASE = env_str("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1")
+
+# --- AGEN 1: FLASH Llama 3.1 8B (OpenRouter -> Groq, ultra cepat) ---
+KIMI_MODEL = env_str("KIMI_MODEL", "meta-llama/llama-3.1-8b-instruct")
+KIMI_API_KEY = env_str("OPENROUTER_API_KEY_KIMI") or env_str("OPENROUTER_API_KEY")
+KIMI_REASONING = env_bool("KIMI_REASONING", False)
+KIMI_MAX_TOKENS = env_int("KIMI_MAX_TOKENS", 400)   # flash model, lebih cepat
+# --- Groq provider untuk Llama 8B (cepat!) ---
+KIMI_PROVIDER = env_str("KIMI_PROVIDER", "groq")
+KIMI_ALLOW_FALLBACK = env_bool("KIMI_ALLOW_FALLBACK", False)
+
+
+# --- AGEN 2: DEEPSEEK V4 FLASH (EvoMap, endpoint & key sendiri) ---
+EVOMAP_MODEL = env_str("EVOMAP_MODEL", "evomap-deepseek-v4-flash")
+EVOMAP_BASE = env_str("EVOMAP_BASE_URL", "https://api.evomap.ai/v1")
+
+# --- AGEN 3: LLAMA 3.3 70B (OpenRouter, provider dikunci ke Groq) ---
+LLAMA_MODEL = env_str("LLAMA_MODEL", "meta-llama/llama-3.3-70b-instruct")
+LLAMA_API_KEY = env_str("OPENROUTER_API_KEY_LLAMA") or env_str("OPENROUTER_API_KEY")
+LLAMA_PROVIDER = env_str("LLAMA_PROVIDER", "Groq")          # kosongkan = bebas
+LLAMA_ALLOW_FALLBACK = env_bool("LLAMA_ALLOW_FALLBACK", True)
+# Sebagian model (mis. kimi-k2 lewat provider Novita) menolak response_format
+# json_object. TRUE = coba dulu, otomatis mundur ke prompt-only kalau ditolak.
+AI_JSON_MODE = env_bool("AI_JSON_MODE", True)
+# --- GODMODE DIRECTIONAL (V15.4) ---
+GODMODE_ENABLED = env_bool("GODMODE_ENABLED", True)
+GODMODE_MIN_SCORE = env_int("GODMODE_MIN_SCORE", 80)
+GODMODE_DIRECTIONAL_BOOST = env_int("GODMODE_DIRECTIONAL_BOOST", 8)
+GODMODE_COUNTER_TREND_PENALTY = env_int("GODMODE_COUNTER_TREND_PENALTY", 20)
+GODMODE_EXHAUSTION_BONUS = env_int("GODMODE_EXHAUSTION_BONUS", 5)
+# Dipakai kalau EvoMap mati / base URL salah, biar agen 2 tetap hidup.
+EVOMAP_FALLBACK_MODEL = env_str("EVOMAP_FALLBACK_MODEL", "deepseek/deepseek-chat")
+KIMI_INTERVAL_SEC = env_int("KIMI_INTERVAL_SEC", 300)
+AI_TIMEOUT = env_float("AI_TIMEOUT_SEC", 12.0)
+
+# --- Telegram ---
+TELEGRAM_TOKEN = env_str("TELEGRAM_TOKEN")
+TELEGRAM_CHAT_ID = env_str("TELEGRAM_CHAT_ID")
+TELEGRAM_API = "https://api.telegram.org"
+BRIEFING_HOUR = env_int("BRIEFING_HOUR_WIB", 7)
+
+# --- Dashboard / log ---
+DASHBOARD_ENABLED = env_bool("DASHBOARD_ENABLED", True)
+DASHBOARD_ROWS = env_int("DASHBOARD_ROWS", 26)
+DASHBOARD_COLS = env_int("DASHBOARD_COLS", 3)      # radar 26 pair dibagi 3 kolom
+HEARTBEAT_SEC = env_int("HEARTBEAT_SEC", 60)       # ringkasan berkala saat mode log (PM2)
+STATE_FILE = env_str("STATE_FILE", "state_v15.json")
+LOG_FILE = env_str("LOG_FILE", "bot_v15.log")
+
+# --- Deteksi mode tampilan: TUI rich (terminal) vs log ringkas (PM2 / file) ---
+try:
+    from rich import box
+    from rich.align import Align
+    from rich.columns import Columns
+    from rich.console import Console, Group
+    from rich.live import Live
+    from rich.panel import Panel
+    from rich.table import Table
+    from rich.text import Text
+    RICH_OK = True
+except Exception:      # rich opsional -> bot tetap jalan tanpa TUI
+    RICH_OK = False
+
+IS_TTY = bool(getattr(sys.stdout, "isatty", lambda: False)())
+TUI_MODE = DASHBOARD_ENABLED and IS_TTY and RICH_OK
+CONSOLE = Console() if RICH_OK else None
+
+# Saat TUI aktif, log TIDAK boleh ikut ke stdout (biar tidak merusak layar)
+_handlers = [logging.FileHandler(LOG_FILE, encoding="utf-8")]
+if not TUI_MODE:
+    _handlers.append(logging.StreamHandler(sys.stdout))
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)-7s | %(message)s",
+    handlers=_handlers,
+)
+log = logging.getLogger("V15")
+if DASHBOARD_ENABLED and IS_TTY and not RICH_OK:
+    log.warning("Library 'rich' belum terpasang -> pakai mode log ringkas. Jalankan: pip install rich")
+
+MARKET_REGIME_GLOBAL = {
+    "market_regime": "SIDEWAYS_CHOP",
+    "recommended_tactic": "MEAN_REVERSION_ONLY",
+    "rationale": "-",
+    "last_updated": "INITIALIZING",
+}
+
+# ==============================================================================
+# 2. EXCHANGE & AI CLIENTS
+# ==============================================================================
+
+EXCHANGE = ccxtpro.binance({
+    "apiKey": env_str("BINANCE_API_KEY"),
+    "secret": env_str("BINANCE_API_SECRET"),
+    "enableRateLimit": True,
+    "options": {"defaultType": "future"},
+})
+if TESTNET:
+    EXCHANGE.set_sandbox_mode(True)
+
+def evomap_key() -> str:
+    """EvoMap minta format sk-evomap-<KEY>. Prefix ditambah otomatis."""
+    key = env_str("EVOMAP_API_KEY")
+    if not key:
+        return ""
+    return key if key.startswith("sk-evomap-") else f"sk-evomap-{key}"
+
+
+def _buat_klien(api_key: str, base_url: str):
+    if not (AI_LAYER_ENABLED and OpenAI is not None and api_key):
+        return None
+    try:
+        return OpenAI(api_key=api_key, base_url=base_url, timeout=AI_TIMEOUT)
+    except Exception as exc:      # noqa: BLE001
+        print(f"[AI] gagal membuat klien {base_url}: {exc}", flush=True)
+        return None
+
+
+# Tiga agen = tiga klien berdiri sendiri, boleh beda API key & beda endpoint.
+CLIENT_KIMI = _buat_klien(KIMI_API_KEY, OPENROUTER_BASE)
+CLIENT_LLAMA = _buat_klien(LLAMA_API_KEY, OPENROUTER_BASE)
+CLIENT_EVOMAP = _buat_klien(evomap_key(), EVOMAP_BASE)
+
+# Dipakai untuk fallback DeepSeek lewat OpenRouter.
+client_or = CLIENT_KIMI or CLIENT_LLAMA
+
+AI_STATUS = {
+    "kimi": "READY" if CLIENT_KIMI else "NO KEY",
+    "deepseek": "READY" if CLIENT_EVOMAP else "NO KEY",
+    "llama": "READY" if CLIENT_LLAMA else "NO KEY",
+}
+
+
+# --- AI Call Budget (hemat Llama 3.3 70B) ---
+AI_CALL_COOLDOWN_SEC = env_int("AI_CALL_COOLDOWN_SEC", 120)
+_AI_LAST_CALL = {}
+
+
+# ==============================================================================
+# 3. TELEGRAM (dengan retry, anti silent-fail)
+# ==============================================================================
+
+
+async def tg_send(text: str, retries: int = 3) -> bool:
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+        log.warning("Telegram tidak dikonfigurasi, pesan dilewati.")
+        return False
+    url = f"{TELEGRAM_API}/bot{TELEGRAM_TOKEN}/sendMessage"
+    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "Markdown",
+               "disable_web_page_preview": True}
+    for attempt in range(1, retries + 1):
+        try:
+            async with httpx.AsyncClient() as client:
+                res = await client.post(url, json=payload, timeout=10.0)
+            if res.status_code == 200:
+                return True
+            log.error("Telegram HTTP %s: %s", res.status_code, res.text[:200])
+            if res.status_code == 400:  # markdown rusak -> kirim plain
+                payload.pop("parse_mode", None)
+        except Exception as exc:
+            log.error("Telegram error (attempt %s): %s", attempt, exc)
+        await asyncio.sleep(1.5 * attempt)
+    return False
+
+
+# ==============================================================================
+# 4. TRADE JOURNAL  (BUG FIX 3: statistik WIN / LOSS)
+# ==============================================================================
+
+
+class TradeJournal:
+    def __init__(self, path: str):
+        self.path = path
+        self.trades = deque(maxlen=2000)
+        self.reentry_count = {}
+        self.reentry_day = datetime.now(WIB).strftime("%Y-%m-%d")
+        self._load()
+
+    def _load(self):
+        try:
+            if os.path.exists(self.path):
+                with open(self.path, "r", encoding="utf-8") as fh:
+                    data = json.load(fh)
+                self.trades = deque(data.get("trades", []), maxlen=2000)
+                self.reentry_count = data.get("reentry_count", {})
+                self.reentry_day = data.get("reentry_day", self.reentry_day)
+        except Exception as exc:
+            log.error("Gagal load state: %s", exc)
+
+    def save(self):
+        try:
+            tmp = f"{self.path}.tmp"
+            with open(tmp, "w", encoding="utf-8") as fh:
+                json.dump({
+                    "trades": list(self.trades),
+                    "reentry_count": self.reentry_count,
+                    "reentry_day": self.reentry_day,
+                }, fh, ensure_ascii=False, indent=1)
+            os.replace(tmp, self.path)
+        except Exception as exc:
+            log.error("Gagal simpan state: %s", exc)
+
+    # --- re-entry counter harian (BUG FIX 1) ---
+    def _roll_day(self):
+        today = datetime.now(WIB).strftime("%Y-%m-%d")
+        if today != self.reentry_day:
+            self.reentry_day = today
+            self.reentry_count = {}
+
+    def reentries_today(self, symbol: str) -> int:
+        self._roll_day()
+        return int(self.reentry_count.get(symbol, 0))
+
+    def bump_reentry(self, symbol: str):
+        self._roll_day()
+        self.reentry_count[symbol] = self.reentries_today(symbol) + 1
+        self.save()
+
+    # --- pencatatan trade ---
+    def record_close(self, trade: dict):
+        self.trades.append(trade)
+        self.save()
+
+    def stats(self, hours: int = 24) -> dict:
+        cutoff = datetime.now(timezone.utc) - timedelta(hours=hours)
+        rows = []
+        for t in self.trades:
+            try:
+                if datetime.fromisoformat(t["closed_at"]) >= cutoff:
+                    rows.append(t)
+            except Exception:
+                continue
+        wins = [t for t in rows if t.get("pnl_usdt", 0) > 0]
+        losses = [t for t in rows if t.get("pnl_usdt", 0) <= 0]
+        pnl = sum(t.get("pnl_usdt", 0.0) for t in rows)
+        fee_total = sum(t.get("fee_usdt", 0.0) for t in rows)
+        pnl_gross = sum(t.get("pnl_gross_usdt", t.get("pnl_usdt", 0.0)) for t in rows)
+        gross_win = sum(t["pnl_usdt"] for t in wins)
+        gross_loss = abs(sum(t["pnl_usdt"] for t in losses))
+        best = max(rows, key=lambda t: t.get("pnl_pct", 0), default=None)
+        worst = min(rows, key=lambda t: t.get("pnl_pct", 0), default=None)
+        return {
+            "total": len(rows),
+            "win": len(wins),
+            "loss": len(losses),
+            "win_rate": (len(wins) / len(rows) * 100.0) if rows else 0.0,
+            "pnl_usdt": pnl,
+            "fee_usdt": fee_total,
+            "pnl_gross_usdt": pnl_gross,
+            "profit_factor": (gross_win / gross_loss) if gross_loss > 0 else (float("inf") if gross_win > 0 else 0.0),
+            "best": best,
+            "worst": worst,
+        }
+
+
+JOURNAL = TradeJournal(STATE_FILE)
+
+
+# ==============================================================================
+# 5. POSITION REGISTRY  (BUG FIX 1 + 2: lock per pair & cap global)
+# ==============================================================================
+
+
+class PositionRegistry:
+    """Sumber kebenaran tunggal untuk posisi terbuka + lock & cooldown."""
+
+    def __init__(self):
+        self.open = {}        # symbol -> dict posisi
+        self.pending = set()  # symbol yang sedang diproses (anti race async)
+        self.cooldown = {}    # symbol -> epoch boleh entry lagi
+        self.last_signal = {}  # symbol -> epoch sinyal terakhir (dedup)
+        self.lock = asyncio.Lock()
+
+    # ---------- gate ----------
+    def slots_used(self) -> int:
+        return len(self.open) + len(self.pending)
+
+    def slots_free(self) -> int:
+        return max(0, MAX_OPEN_POSITIONS - self.slots_used())
+
+    def gate_reason(self, symbol: str) -> str | None:
+        """Return None kalau boleh entry, atau alasan penolakan."""
+        now = datetime.now(timezone.utc).timestamp()
+        if symbol in self.pending:
+            return "PENDING_EXEC"
+        if symbol in self.open:
+            return "IN_POSITION"
+        if len([s for s in self.open if s == symbol]) >= MAX_POSITION_PER_PAIR:
+            return "PAIR_CAP"
+        cd = self.cooldown.get(symbol, 0)
+        if now < cd:
+            return f"COOLDOWN_{int(cd - now)}s"
+        if MAX_REENTRY_PER_PAIR_DAY > 0 and JOURNAL.reentries_today(symbol) >= MAX_REENTRY_PER_PAIR_DAY:
+            return "REENTRY_LIMIT_DAY"   # dilewati kalau MAX_REENTRY_PER_PAIR_DAY = 0 (unlimited)
+        if self.slots_free() <= 0:
+            return "OVERFLOW_MAX_POS"
+        if now - self.last_signal.get(symbol, 0) < SIGNAL_DEDUP_SEC:
+            return "SIGNAL_DEDUP"
+        return None
+
+    def mark_signal(self, symbol: str):
+        self.last_signal[symbol] = datetime.now(timezone.utc).timestamp()
+
+    # ---------- lifecycle ----------
+    async def reserve(self, symbol: str) -> bool:
+        async with self.lock:
+            if self.gate_reason(symbol) is not None:
+                return False
+            self.pending.add(symbol)
+            return True
+
+    async def release_pending(self, symbol: str):
+        async with self.lock:
+            self.pending.discard(symbol)
+
+    async def commit(self, symbol: str, position: dict):
+        async with self.lock:
+            self.pending.discard(symbol)
+            self.open[symbol] = position
+        JOURNAL.bump_reentry(symbol)
+
+    async def close(self, symbol: str):
+        async with self.lock:
+            self.open.pop(symbol, None)
+            self.pending.discard(symbol)
+            self.cooldown[symbol] = datetime.now(timezone.utc).timestamp() + REENTRY_COOLDOWN_SEC
+
+
+REGISTRY = PositionRegistry()
+
+
+# ==============================================================================
+# 5B. EKUITAS LIVE & MARGIN DINAMIS (tidak lagi patokan $40)
+# ==============================================================================
+
+EQUITY = {
+    "total": 0.0,        # saldo wallet + unrealized
+    "free": 0.0,         # margin yang masih bebas
+    "sumber": "INIT",    # LIVE / PAPER / FALLBACK
+    "updated": "-",
+}
+
+
+def equity_now() -> float:
+    """Ekuitas terpakai untuk semua perhitungan risiko."""
+    nilai = float(EQUITY.get("total") or 0.0)
+    return nilai if nilai > 0 else EQUITY_FALLBACK_USDT
+
+
+def margin_now() -> float:
+    """Margin per trade. Ikut saldo riil kalau MARGIN_AUTO aktif."""
+    if not MARGIN_AUTO:
+        return MARGIN_USDT
+    nilai = equity_now() * MARGIN_PCT_OF_EQUITY
+    if MARGIN_MAX_USDT > 0:
+        nilai = min(nilai, MARGIN_MAX_USDT)
+    return max(MARGIN_MIN_USDT, round(nilai, 2))
+
+
+def notional_now() -> float:
+    return margin_now() * LEVERAGE
+
+
+# [V15.4] margin_txt removed
+
+
+async def refresh_equity(diam: bool = True) -> float:
+    """Baca saldo USDT nyata dari Binance. Dry-run tanpa key -> ekuitas paper."""
+    punya_key = bool(env_str("BINANCE_API_KEY"))
+    if punya_key:
+        try:
+            bal = await EXCHANGE.fetch_balance()
+            usdt = bal.get("USDT") or {}
+            total = float(usdt.get("total") or 0.0)
+            free = float(usdt.get("free") or total)
+            if total > 0:
+                EQUITY.update({"total": total, "free": free, "sumber": "LIVE",
+                               "updated": datetime.now(WIB).strftime("%H:%M:%S")})
+                return total
+        except Exception as exc:
+            if not diam:
+                log.warning("Baca saldo gagal: %s", exc)
+    # Paper: modal awal + akumulasi PnL bersih yang sudah tercatat.
+    realized = 0.0
+    try:
+        realized = float(JOURNAL.stats(24 * 3650).get("pnl_usdt") or 0.0)
+    except Exception:
+        realized = 0.0
+    total = max(EQUITY_FALLBACK_USDT + realized, 0.0)
+    EQUITY.update({"total": total, "free": total,
+                   "sumber": "PAPER" if DRY_RUN_MODE else "FALLBACK",
+                   "updated": datetime.now(WIB).strftime("%H:%M:%S")})
+    return total
+
+
+async def equity_worker():
+    """Segarkan saldo berkala supaya sizing selalu ikut dana riil."""
+    while True:
+        try:
+            await refresh_equity()
+        except Exception as exc:
+            log.warning("equity_worker: %s", exc)
+        await asyncio.sleep(max(15, EQUITY_REFRESH_SEC))
+
+
+# ==============================================================================
+# 6. INDIKATOR LOKAL
+# ==============================================================================
+
+
+def hitung_stoch_rsi(df: pd.DataFrame, period=STOCH_PERIOD, smooth_k=STOCH_SMOOTH_K,
+                     smooth_d=STOCH_SMOOTH_D):
+    delta = df["close"].diff()
+    gain = delta.where(delta > 0, 0.0).rolling(window=period).mean()
+    loss = (-delta.where(delta < 0, 0.0)).rolling(window=period).mean()
+    rs = gain / (loss + 1e-9)
+    rsi = 100.0 - (100.0 / (1.0 + rs))
+    rsi_min = rsi.rolling(window=period).min()
+    rsi_max = rsi.rolling(window=period).max()
+    stoch = (rsi - rsi_min) / (rsi_max - rsi_min + 1e-9) * 100.0
+    k = stoch.rolling(window=smooth_k).mean()
+    d = k.rolling(window=smooth_d).mean()
+    return float(k.iloc[-1]), float(d.iloc[-1])
+
+
+
+
+def hitung_rsi(df: pd.DataFrame, period: int = RSI_PERIOD) -> float:
+    """Hitung RSI murni (bukan Stochastic RSI) dengan periode yang bisa diatur."""
+    delta = df["close"].diff()
+    gain = delta.where(delta > 0, 0.0).rolling(window=period).mean()
+    loss = (-delta.where(delta < 0, 0.0)).rolling(window=period).mean()
+    rs = gain / (loss + 1e-9)
+    rsi = 100.0 - (100.0 / (1.0 + rs))
+    return float(rsi.iloc[-1])
+
+
+def hitung_stoch_rsi_with_cross(df: pd.DataFrame, period=STOCH_PERIOD, smooth_k=STOCH_SMOOTH_K,
+                                 smooth_d=STOCH_SMOOTH_D):
+    """Hitung Stochastic RSI + deteksi cross K/D + touch zone detection."""
+    delta = df["close"].diff()
+    gain = delta.where(delta > 0, 0.0).rolling(window=period).mean()
+    loss = (-delta.where(delta < 0, 0.0)).rolling(window=period).mean()
+    rs = gain / (loss + 1e-9)
+    rsi = 100.0 - (100.0 / (1.0 + rs))
+    rsi_min = rsi.rolling(window=period).min()
+    rsi_max = rsi.rolling(window=period).max()
+    stoch = (rsi - rsi_min) / (rsi_max - rsi_min + 1e-9) * 100.0
+    k = stoch.rolling(window=smooth_k).mean()
+    d = k.rolling(window=smooth_d).mean()
+
+    k_now = float(k.iloc[-1])
+    d_now = float(d.iloc[-1])
+    k_prev = float(k.iloc[-2])
+    d_prev = float(d.iloc[-2])
+
+    # Golden cross: K crosses ABOVE D (bullish)
+    golden_cross = k_prev <= d_prev and k_now > d_now
+    # Dead cross: K crosses BELOW D (bearish)
+    dead_cross = k_prev >= d_prev and k_now < d_now
+
+    # ============================================================
+    # TOUCH ZONE DETECTION (last 5 candles)
+    # ============================================================
+    # SHORT: K sempat menyentuh/menembus 85-90 (OB zone)
+    # LONG:  K sempat menyentuh/menembus 10-15 (OS zone)
+    # ============================================================
+    lookback = min(10, len(k) - 1)
+    k_recent = [float(k.iloc[-i]) for i in range(1, lookback + 1)]
+
+    TOUCH_OB = STOCH_OB - 5   # 90 - 5 = 85
+    TOUCH_OS = STOCH_OS + 5   # 10 + 5 = 15
+
+    touched_ob = any(kv >= TOUCH_OB for kv in k_recent)
+    touched_os = any(kv <= TOUCH_OS for kv in k_recent)
+
+    return k_now, d_now, golden_cross, dead_cross, touched_ob, touched_os
+
+def hitung_atr(df: pd.DataFrame, period=ATR_PERIOD) -> float:
+    prev_close = df["close"].shift(1)
+    tr = np.maximum(
+        df["high"] - df["low"],
+        np.maximum((df["high"] - prev_close).abs(), (df["low"] - prev_close).abs()),
+    )
+    return float(pd.Series(tr).rolling(window=period).mean().iloc[-1])
+
+
+async def ambil_metrics(symbol: str):
+    ohlcv = await EXCHANGE.fetch_ohlcv(symbol, timeframe=TIMEFRAME, limit=100)
+    # Multi-TF: fetch 15m trend data
+    k_trend, d_trend, rsi_trend = 50.0, 50.0, 50.0
+    try:
+        ohlcv_t = await EXCHANGE.fetch_ohlcv(symbol, timeframe=TIMEFRAME_TREND, limit=50)
+        df_t = pd.DataFrame(ohlcv_t, columns=["timestamp","open","high","low","close","volume"])
+        k_trend, d_trend = hitung_stoch_rsi(df_t)
+        rsi_trend = hitung_rsi(df_t, period=14)
+    except Exception:
+        pass
+    df = pd.DataFrame(ohlcv, columns=["timestamp", "open", "high", "low", "close", "volume"])
+    if len(df) < max(ATR_PERIOD, STOCH_PERIOD) + 5:
+        raise ValueError("data candle kurang")
+    k, d, golden_cross, dead_cross, touched_ob, touched_os = hitung_stoch_rsi_with_cross(df)
+    rsi = hitung_rsi(df)
+    atr = hitung_atr(df)
+    if not all(map(math.isfinite, (k, d, atr, rsi))):
+        raise ValueError("indikator NaN")
+    if atr <= 0:
+        raise ValueError("ATR nol/negatif -> skip")
+    return {
+        "live": float(df["close"].iloc[-1]),
+        "open": float(df["open"].iloc[-1]),
+        "k": k,
+        "d": d,
+        "rsi": rsi,
+        "golden_cross": golden_cross,
+        "dead_cross": dead_cross,
+        "touched_ob": touched_ob,
+        "touched_os": touched_os,
+        "atr": atr,
+        "volume": float(df["volume"].iloc[-1]),
+        "df": df,
+        "k_trend": k_trend, "d_trend": d_trend, "rsi_trend": rsi_trend,
+    }
+
+
+# ==============================================================================
+# 6B. JAM PASAR TRADFI (XAU / XAG / XPT) — dilarang entry saat pasar tutup
+# ==============================================================================
+# Jadwal acuan COMEX / spot logam:
+#   BUKA  : Minggu 18:00 ET
+#   TUTUP : Jumat 17:00 ET
+#   JEDA HARIAN : 17:00 - 18:00 ET (setiap hari kerja)
+# Semua dihitung otomatis di zona America/New_York, jadi DST ikut menyesuaikan.
+
+TRADFI_HOURS_ENABLED = env_bool("TRADFI_MARKET_HOURS_ENABLED", True)
+TRADFI_PAIRS = set(
+    p.strip().upper()
+    for p in env_str("TRADFI_PAIRS", "XAU/USDT,XAG/USDT,XPT/USDT").split(",")
+    if p.strip()
+)
+TRADFI_ENTRY_BUFFER_MIN = env_int("TRADFI_ENTRY_BUFFER_MIN", 15)
+TRADFI_FORCE_CLOSE = env_bool("TRADFI_FORCE_CLOSE_BEFORE_CLOSE", True)
+TRADFI_FORCE_CLOSE_BUFFER_MIN = env_int("TRADFI_FORCE_CLOSE_BUFFER_MIN", 5)
+
+try:
+    from zoneinfo import ZoneInfo
+    NY_TZ = ZoneInfo("America/New_York")
+except Exception:
+    NY_TZ = timezone(timedelta(hours=-4))  # fallback kasar kalau tzdata tidak ada
+    log.warning("tzdata tidak tersedia, jam TradFi pakai fallback UTC-4")
+
+TRADFI_CLOSE_MIN = 17 * 60   # 17:00 ET
+TRADFI_OPEN_MIN = 18 * 60    # 18:00 ET
+
+
+def cek_pasar_tradfi(buffer_min: int = 0):
+    """Return (buka: bool, alasan: str). buffer_min = tutup lebih awal X menit."""
+    if not TRADFI_HOURS_ENABLED:
+        return True, "HOURS_CHECK_OFF"
+    now = datetime.now(NY_TZ)
+    wd = now.weekday()          # Senin=0 ... Sabtu=5, Minggu=6
+    minute_of_day = now.hour * 60 + now.minute
+    tutup_efektif = TRADFI_CLOSE_MIN - max(0, buffer_min)
+
+    if wd == 5:
+        return False, "WEEKEND_SABTU"
+    if wd == 6:
+        if minute_of_day < TRADFI_OPEN_MIN:
+            return False, "WEEKEND_MINGGU_PRE_OPEN"
+        return True, "OPEN_SESI_MINGGU"
+    if wd == 4 and minute_of_day >= tutup_efektif:
+        return False, "WEEKEND_TUTUP_JUMAT"
+    if wd <= 3 and tutup_efektif <= minute_of_day < TRADFI_OPEN_MIN:
+        return False, "JEDA_HARIAN_1700_1800_ET"
+    return True, "OPEN"
+
+
+def is_tradfi(symbol: str) -> bool:
+    s = symbol.upper()
+    if s in TRADFI_PAIRS:
+        return True
+    # cocokkan juga bentuk lain: XAU/USDT:USDT, XAUUSDT, dll.
+    basis = s.split("/")[0].split(":")[0]
+    return any(basis == t.split("/")[0] for t in TRADFI_PAIRS)
+
+
+def resolve_symbol(symbol: str, markets) -> str:
+    """Cari nama simbol yang benar-benar dipakai bursa.
+
+    Binance kadang memakai unified symbol berakhiran :USDT untuk perpetual
+    (mis. XAU/USDT:USDT). Fungsi ini mencocokkan otomatis supaya pair logam
+    tidak terbuang percuma hanya karena beda penulisan.
+    """
+    if not markets:
+        return symbol
+    if symbol in markets:
+        return symbol
+    for kandidat in (f"{symbol}:USDT", symbol.replace("/", ""),
+                     f"{symbol}:USDC"):
+        if kandidat in markets:
+            return kandidat
+    basis, _, kuota = symbol.partition("/")
+    kuota = (kuota or "USDT").split(":")[0]
+    for nama, pasar in markets.items():
+        try:
+            if (str(pasar.get("base", "")).upper() == basis
+                    and str(pasar.get("quote", "")).upper() == kuota
+                    and pasar.get("swap", pasar.get("contract", False))
+                    and pasar.get("active", True)):
+                return nama
+        except Exception:
+            continue
+    return ""
+
+
+def tradfi_boleh_entry(symbol: str):
+    """Gate entry khusus pair logam. Return (boleh, alasan)."""
+    if not is_tradfi(symbol):
+        return True, "CRYPTO_24_7"
+    return cek_pasar_tradfi(TRADFI_ENTRY_BUFFER_MIN)
+
+
+def status_pasar_tradfi() -> str:
+    if not TRADFI_HOURS_ENABLED:
+        return "🟡 GATE OFF"
+    buka, alasan = cek_pasar_tradfi()
+    now_et = datetime.now(NY_TZ).strftime("%a %H:%M")
+    return f"{'🟢 OPEN' if buka else '🌙 CLOSED'} ({alasan} | ET {now_et})"
+
+
+# ==============================================================================
+# 7. AI AGENTS
+# ==============================================================================
+
+PROMPT_KIMI = (
+    "Analisis BTC/USDT futures untuk scalping 5 menit. Perhatikan: "
+    "1) Struktur tren harga (higher highs/lows atau lower highs/lows) "
+    "2) Momentum (RSI, MACD arah) "
+    "3) Volume dan funding rate "
+    "4) Level support/resistance kunci "
+    "PENTING: Gunakan UPTREND saat harga jelas naik, DOWNTREND saat jelas turun. "
+    "SIDEWAYS_CHOP hanya saat tidak ada tren jelas. "
+    "Balas JSON: 'market_regime' (UPTREND/DOWNTREND/SIDEWAYS_CHOP), "
+    "'recommended_tactic' (TREND_FOLLOWING_AGGRESSIVE/MEAN_REVERSION_ONLY/SCALP_BOTH), "
+    "'confidence' (1-100, seberapa yakin), "
+    "'bias' (LONG_PREFERRED/SHORT_PREFERRED/NEUTRAL), "
+    "'global_bias_rationale' (1 kalimat)."
+)
+
+
+SYS_JSON = (
+    "Anda mesin yang hanya bisa membalas satu objek JSON valid. "
+    "Dilarang menulis penjelasan, salam, atau blok markdown."
+)
+
+_NO_JSON_MODE = set()  # model yang terbukti menolak response_format
+
+
+def _ekstrak_json(teks) -> dict:
+    """Parse JSON dari balasan model walau dibungkus ```json atau kalimat."""
+    if isinstance(teks, dict):
+        return teks
+    t = (teks or "").strip()
+    if not t:
+        return {}
+    if t.startswith("```"):
+        bagian = t.split("```")
+        if len(bagian) > 1:
+            t = bagian[1]
+        if t.lstrip().lower().startswith("json"):
+            t = t.lstrip()[4:]
+        t = t.strip()
+    try:
+        return json.loads(t)
+    except Exception:
+        pass
+    i, j = t.find("{"), t.rfind("}")
+    if i != -1 and j > i:
+        try:
+            return json.loads(t[i:j + 1])
+        except Exception:
+            return {}
+    return {}
+
+
+def _chat_json(client, model: str, prompt: str, max_tokens: int = 200,
+               extra_body=None) -> dict:
+    """Panggil satu model dan paksa hasilnya jadi dict JSON.
+
+    Dipakai bertiga oleh Kimi / DeepSeek / Llama, masing-masing boleh bawa
+    klien sendiri (base_url + API key sendiri) dan extra_body sendiri
+    (reasoning untuk Kimi, provider routing untuk Llama).
+    """
+    if client is None:
+        raise RuntimeError("klien AI tidak aktif (API key kosong?)")
+    kwargs = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": SYS_JSON},
+            {"role": "user", "content": prompt},
+        ],
+        "max_tokens": max_tokens,
+        "temperature": 0.2,
+    }
+    if extra_body:
+        kwargs["extra_body"] = extra_body
+
+    if AI_JSON_MODE and model not in _NO_JSON_MODE:
+        try:
+            res = client.chat.completions.create(
+                response_format={"type": "json_object"}, **kwargs)
+            raw_content = res.choices[0].message.content
+            log.info("AI_RAW model=%s content=%s", model, str(raw_content)[:300])
+            return _ekstrak_json(raw_content)
+        except Exception as exc:
+            pesan = str(exc).lower()
+            tanda = ("structured-outputs" in pesan or "response_format" in pesan
+                     or "json_object" in pesan or "invalid_request_body" in pesan)
+            if not tanda:
+                raise
+            _NO_JSON_MODE.add(model)
+            log.warning("Model %s tolak json_object -> pindah mode prompt-only", model)
+    res = client.chat.completions.create(**kwargs)
+    return _ekstrak_json(res.choices[0].message.content)
+
+
+def _or_json(model: str, prompt: str, max_tokens: int = 200) -> dict:
+    """Jalur OpenRouter umum (dipakai fallback DeepSeek)."""
+    return _chat_json(client_or, model, prompt, max_tokens)
+
+
+def _extra_kimi():
+    """Extra params untuk Kimi/Flash model. Groq provider untuk speed."""
+    extra = {}
+    if KIMI_REASONING:
+        extra["reasoning"] = {"enabled": True}
+    if KIMI_PROVIDER:
+        extra["provider"] = {
+            "order": [KIMI_PROVIDER],
+            "allow_fallbacks": KIMI_ALLOW_FALLBACK,
+        }
+    return extra if extra else None
+
+
+def _extra_llama():
+    if not LLAMA_PROVIDER:
+        return None
+    return {"provider": {"order": [LLAMA_PROVIDER],
+                         "allow_fallbacks": LLAMA_ALLOW_FALLBACK}}
+
+
+async def agent1_kimi_macro():
+    """AGEN 1 — Llama 3.1 8B Flash lewat OpenRouter -> Groq, ultra cepat."""
+    global MARKET_REGIME_GLOBAL
+    if CLIENT_KIMI is None:
+        AI_STATUS["kimi"] = "NO KEY"
+        MARKET_REGIME_GLOBAL["last_updated"] = "NO KEY"
+        return
+    try:
+        data = await asyncio.to_thread(
+            _chat_json, CLIENT_KIMI, KIMI_MODEL, PROMPT_KIMI,
+            KIMI_MAX_TOKENS, _extra_kimi())
+        AI_STATUS["kimi"] = "OK"  # label tetap "kimi" untuk kompatibilitas dashboard
+        confidence = int(data.get("confidence", 50))
+        regime_val = data.get("market_regime", "SIDEWAYS_CHOP")
+        # Kalau confidence rendah, paksa SIDEWAYS (lebih aman)
+        if confidence < 40:
+            regime_val = "SIDEWAYS_CHOP"
+            log.info("KIMI confidence %d < 40 -> forced SIDEWAYS", confidence)
+        # Normalisasi regime
+        if regime_val in ("BULLISH_TREND", "UPTREND"):
+            regime_val = "UPTREND"
+        elif regime_val in ("BEARISH_TREND", "DOWNTREND"):
+            regime_val = "DOWNTREND"
+        MARKET_REGIME_GLOBAL = {
+            "market_regime": regime_val,
+            "recommended_tactic": data.get("recommended_tactic", "MEAN_REVERSION_ONLY"),
+            "rationale": data.get("global_bias_rationale", "-"),
+            "bias": data.get("bias", "NEUTRAL"),
+            "confidence": confidence,
+            "last_updated": datetime.now(WIB).strftime("%H:%M:%S"),
+        }
+        log.info("FLASH regime=%s bias=%s conf=%d", regime_val, 
+                 MARKET_REGIME_GLOBAL["bias"], confidence)
+        push_event("REGIME", f"Kimi: {regime_val} ({confidence}%) · "
+                             f"{MARKET_REGIME_GLOBAL['recommended_tactic']}")
+    except Exception as exc:
+        AI_STATUS["kimi"] = "ERROR"
+        # V15.4: local fallback berdasarkan RSI/ATR (tanpa AI)
+        log.warning("Kimi gagal: %s -> using local regime", exc)
+        try:
+            _ohlcv = await EXCHANGE.fetch_ohlcv("BTC/USDT", timeframe="15m", limit=50)
+            _df = pd.DataFrame(_ohlcv, columns=["timestamp","open","high","low","close","volume"])
+            _delta = _df["close"].diff()
+            _gain = _delta.where(_delta > 0, 0.0).rolling(14).mean()
+            _loss = (-_delta.where(_delta < 0, 0.0)).rolling(14).mean()
+            _rs = _gain / (_loss + 1e-9)
+            _rsi = float((100.0 - (100.0 / (1.0 + _rs))).iloc[-1])
+            _atr = hitung_atr(_df)
+            _atr_pct = _atr / float(_df["close"].iloc[-1]) * 100
+            if _rsi > 60 and _atr_pct > 0.3:
+                _regime = "UPTREND"
+            elif _rsi < 40 and _atr_pct > 0.3:
+                _regime = "DOWNTREND"
+            else:
+                _regime = "SIDEWAYS_CHOP"
+            MARKET_REGIME_GLOBAL.update({
+                "market_regime": _regime,
+                "recommended_tactic": "TREND_FOLLOWING_AGGRESSIVE" if _regime != "SIDEWAYS_CHOP" else "MEAN_REVERSION_ONLY",
+                "confidence": 30,
+                "bias": "NEUTRAL",
+                "rationale": f"LOCAL fallback RSI={_rsi:.0f} ATR%={_atr_pct:.2f}",
+                "last_updated": datetime.now(WIB).strftime("%H:%M:%S"),
+            })
+            log.info("LOCAL regime=%s RSI=%.0f ATR%%=%.2f", _regime, _rsi, _atr_pct)
+        except Exception as exc2:
+            MARKET_REGIME_GLOBAL["last_updated"] = "FALLBACK_FAIL"
+            log.error("Local regime fallback gagal: %s", exc2)
+
+
+def _baca_putusan_agent2(data: dict, tag: str):
+    raw = str(data.get("decision", "")).upper()
+    ok = raw in ("CONFIRMED", "EXECUTE", "BUY", "SELL", "OPEN", "YES", "GO")
+    reason = data.get("audit_log", data.get("reason", data.get("analysis", "-")))
+    if not ok:
+        log.info("DeepSeek raw decision: %s | data: %s", raw, str(data)[:200])
+    return (ok, f"{tag}{reason}")
+
+
+async def agent2_deepseek(symbol: str, side: str, m: dict, funding: float):
+    """AGEN 2 — DeepSeek V4 Flash lewat EvoMap (base_url & API key sendiri)."""
+    prompt = (
+        f"Anda adalah filter final bot scalping crypto. Setup: {symbol} {side} pada harga {m['live']:.4f}. "
+        f"ATR={m['atr']:.6f}, StochRSI K={m['k']:.1f} D={m['d']:.1f}, RSI7={m.get('rsi',50):.1f}, "
+        f"StochCross={'GoldenCross' if m.get('golden_cross') else ('DeadCross' if m.get('dead_cross') else 'NoCross')}, "
+        f"funding={funding:.6f}. "
+        f"Regime={MARKET_REGIME_GLOBAL.get('market_regime','?')}. "
+        f"Strategi: Trend Pullback - {side} saat pullback di tren {MARKET_REGIME_GLOBAL.get('market_regime','?')}. "
+        "Ini bot scalping 5 menit dengan strategi Buy-the-Dip / Sell-the-Rally. "
+        "Jika RSI7 ekstrem + Stoch cross mendukung arah trade, bilang CONFIRMED. "
+        "Hanya REJECT kalau ada sinyal kuat reversal atau manipulasi harga. "
+        "Balas JSON: 'decision' (CONFIRMED/REJECT), 'sentiment_score' (1-100), 'audit_log' (1 kalimat singkat)."
+    )
+    if CLIENT_EVOMAP is not None:
+        try:
+            data = await asyncio.to_thread(
+                _chat_json, CLIENT_EVOMAP, EVOMAP_MODEL, prompt, 220)
+            AI_STATUS["deepseek"] = "OK"
+            if not data:
+                log.warning("EvoMap returned empty dict for %s %s", symbol, side)
+            return _baca_putusan_agent2(data, "")
+        except Exception as exc:
+            AI_STATUS["deepseek"] = "FALLBACK"
+            log.warning("EvoMap gagal (%s) -> fallback %s", exc, EVOMAP_FALLBACK_MODEL)
+    # Jaring pengaman: DeepSeek lewat OpenRouter supaya agen 2 tetap hidup.
+    if client_or is not None and EVOMAP_FALLBACK_MODEL:
+        try:
+            log.info("DeepSeek fallback -> %s via OpenRouter", EVOMAP_FALLBACK_MODEL)
+            data = await asyncio.to_thread(
+                _or_json, EVOMAP_FALLBACK_MODEL, prompt, 220)
+            AI_STATUS["deepseek"] = "FALLBACK_OK"
+            return _baca_putusan_agent2(data, "[FB] ")
+        except Exception as exc:
+            log.error("DeepSeek fallback gagal: %s", exc)
+            AI_STATUS["deepseek"] = "FALLBACK_ERROR"
+    AI_STATUS["deepseek"] = "OFF"
+    return (AI_FAIL_OPEN, "EvoMap & fallback gagal")
+    try:
+        data = await asyncio.to_thread(_or_json, EVOMAP_FALLBACK_MODEL, prompt, 220)
+        AI_STATUS["deepseek"] = "FALLBACK"
+        return _baca_putusan_agent2(data, "[fallback] ")
+    except Exception as exc:
+        AI_STATUS["deepseek"] = "ERROR"
+        log.error("Agent2 DeepSeek error: %s", exc)
+        return (AI_FAIL_OPEN, f"DeepSeek driver failure: {exc}")
+
+
+async def agent3_llama(symbol: str, side: str, m: dict, book_summary: str):
+    """AGEN 3 — Llama 3.3 70B lewat OpenRouter, provider dikunci ke Groq."""
+    if CLIENT_LLAMA is None:
+        AI_STATUS["llama"] = "NO KEY"
+        return (AI_FAIL_OPEN, "Llama tidak aktif (API key kosong)")
+    prompt = (
+        f"Anda filter final bot scalping 5 menit (Trend Pullback). Audit {symbol} {side}.\n"
+        f"Data: harga={m['live']:.4f} ATR={m['atr']:.6f} K={m['k']:.1f} D={m['d']:.1f} "
+        f"RSI7={m.get('rsi',50):.1f} StochCross={'GoldenCross' if m.get('golden_cross') else ('DeadCross' if m.get('dead_cross') else 'NoCross')}\n"
+        f"Order book: {book_summary}\n"
+        f"Market regime: {MARKET_REGIME_GLOBAL.get('market_regime','?')}\n"
+        f"Strategi: {side} di zona pullback saat regime {MARKET_REGIME_GLOBAL.get('market_regime','?')}. "
+        f"{'RSI7>80=jenuh beli, cocok SHORT' if side=='SHORT' else 'RSI7<20=jenuh jual, cocok LONG'}\n"
+        f"GODMODE score: {m.get('godmode_score', '?')}\n"
+        "Tugas: TOLAK jika market SIDEWAYS/CHOPPY (butuh tren jelas). "
+        "TOLAK jika RSI tidak ekstrem (belum pullback cukup). "
+        "TOLAK jika order book menunjukkan wall besar. "
+        "SETUJU jika RSI ekstrem + Stoch cross + order book support arah trade. "
+        "Balas JSON: 'veto_decision' (VETO_EXECUTE/VETO_ABORT), 'veto_reason' (1 kalimat)."
+    )
+    try:
+        data = await asyncio.to_thread(
+            _chat_json, CLIENT_LLAMA, LLAMA_MODEL, prompt, 200, _extra_llama())
+        AI_STATUS["llama"] = "OK"
+        raw_dec = str(data.get("veto_decision", "")).upper().strip()
+        ok = raw_dec in ("VETO_EXECUTE", "EXECUTE", "CONFIRMED", "APPROVE", "YES")
+        if not ok:
+            log.info("LLAMA_DEBUG %s raw=%s body=%s", symbol, raw_dec, str(data)[:200])
+        return (ok, data.get("veto_reason", "-"))
+    except Exception as exc:
+        AI_STATUS["llama"] = "ERROR"
+        log.error("Agent3 Llama error: %s", exc)
+        return (AI_FAIL_OPEN, f"Llama driver failure: {exc}")
+
+
+async def ringkas_order_book(symbol: str) -> str:
+    try:
+        ob = await EXCHANGE.fetch_order_book(symbol, limit=20)
+        bid_vol = sum(float(x[1]) for x in ob.get("bids", [])[:20])
+        ask_vol = sum(float(x[1]) for x in ob.get("asks", [])[:20])
+        ratio = bid_vol / (ask_vol + 1e-9)
+        return f"bid20={bid_vol:.2f} ask20={ask_vol:.2f} imbalance={ratio:.2f}"
+    except Exception as exc:
+        return f"orderbook unavailable ({exc})"
+
+
+async def ambil_funding(symbol: str) -> float:
+    try:
+        fr = await EXCHANGE.fetch_funding_rate(symbol)
+        return float(fr.get("fundingRate") or 0.0)
+    except Exception:
+        return 0.0
+
+
+async def ai_alliance(symbol: str, side: str, m: dict):
+    """Return (approved, reason). Pre-filter -> Llama -> DeepSeek."""
+    if not AI_LAYER_ENABLED:
+        return True, "AI layer disabled (raw sensor mode)"
+
+    now = time.time()
+
+    # PRE-FILTER: Skip AI call jika signal tidak cukup kuat
+    rsi = m.get("rsi", 50.0)
+    crossed = m.get("golden_cross", False) or m.get("dead_cross", False)
+    touched = m.get("touched_ob", False) or m.get("touched_os", False)
+
+    score = 0
+    if side == "LONG":
+        if rsi < 20:
+            score += 40
+        elif rsi < 30:
+            score += 20
+        if touched:
+            score += 30
+        if crossed:
+            score += 30
+    elif side == "SHORT":
+        if rsi > 80:
+            score += 40
+        elif rsi > 70:
+            score += 20
+        if touched:
+            score += 30
+        if crossed:
+            score += 30
+
+    MIN_AI_SCORE = 60
+    if score < MIN_AI_SCORE:
+        log.info("AI_SKIP %s %s score=%d < %d", symbol, side, score, MIN_AI_SCORE)
+        return False, f"Signal lemah (score={score})"
+
+    # COOLDOWN: Jangan panggil AI untuk pair yang sama terlalu sering
+    last = _AI_LAST_CALL.get(symbol, 0)
+    if now - last < AI_CALL_COOLDOWN_SEC:
+        remaining = int(AI_CALL_COOLDOWN_SEC - (now - last))
+        log.debug("AI_COOLDOWN %s %ds lagi", symbol, remaining)
+        return False, f"AI cooldown {remaining}s"
+
+    _AI_LAST_CALL[symbol] = now
+
+    # Layer 1: Llama
+    log.info("AI_CALL %s %s score=%d -> Llama", symbol, side, score)
+    book = await ringkas_order_book(symbol)
+    ok3, log3 = await agent3_llama(symbol, side, m, book)
+    if not ok3:
+        return False, f"Llama VETO: {log3}"
+
+    # Layer 2: DeepSeek
+    funding = await ambil_funding(symbol)
+    ok2, log2 = await agent2_deepseek(symbol, side, m, funding)
+    if not ok2:
+        return False, f"DeepSeek REJECT: {log2}"
+
+    return True, log3
+
+
+# ==============================================================================
+# 8. EKSEKUSI ORDER  (BUG FIX 4: execute-then-notify)
+# ==============================================================================
+
+
+async def siapkan_leverage(symbol: str):
+    try:
+        await EXCHANGE.set_leverage(LEVERAGE, symbol)
+    except Exception as exc:
+        log.warning("set_leverage %s gagal: %s", symbol, exc)
+
+
+def hitung_target(side: str, entry: float, atr: float):
+    if side == "LONG":
+        tp = entry * (1 + TP_PCT)
+        sl = entry - (SL_ATR_MULT * atr)
+    else:
+        tp = entry * (1 - TP_PCT)
+        sl = entry + (SL_ATR_MULT * atr)
+    return tp, sl
+
+
+async def eksekusi_order(symbol: str, side: str, m: dict):
+    """Kirim market order + TP/SL ke Binance. Return dict posisi atau raise."""
+    entry_ref = m["live"]
+    notional = notional_now()
+    if NOTIONAL_LIMIT_USDT > 0 and notional > NOTIONAL_LIMIT_USDT:
+        notional = NOTIONAL_LIMIT_USDT
+        log.info("NOTIONAL cap $%.2f for %s", NOTIONAL_LIMIT_USDT, symbol)
+    amount = notional / entry_ref
+    try:
+        amount = float(EXCHANGE.amount_to_precision(symbol, amount))
+    except Exception:
+        amount = round(amount, 6)
+    if amount <= 0:
+        raise ValueError("amount 0 setelah pembulatan precision")
+
+    order_side = "buy" if side == "LONG" else "sell"
+    close_side = "sell" if side == "LONG" else "buy"
+
+    await siapkan_leverage(symbol)
+    order = await EXCHANGE.create_order(symbol, "market", order_side, amount)
+
+    # verifikasi fill nyata (inti BUG FIX 4)
+    filled = float(order.get("filled") or 0.0)
+    avg = float(order.get("average") or order.get("price") or 0.0)
+    if filled <= 0 or avg <= 0:
+        await asyncio.sleep(1.0)
+        try:
+            fetched = await EXCHANGE.fetch_order(order["id"], symbol)
+            filled = float(fetched.get("filled") or 0.0)
+            avg = float(fetched.get("average") or fetched.get("price") or 0.0)
+        except Exception as exc:
+            log.warning("fetch_order %s gagal: %s", symbol, exc)
+    if filled <= 0:
+        raise RuntimeError("order tidak terisi (filled=0) -> notif dibatalkan")
+    entry = avg or entry_ref
+
+    tp, sl = hitung_target(side, entry, m["atr"])
+    tp_id = sl_id = None
+    try:
+        tp_order = await EXCHANGE.create_order(
+            symbol, "TAKE_PROFIT_MARKET", close_side, filled, None,
+            {"stopPrice": float(EXCHANGE.price_to_precision(symbol, tp)),
+             "reduceOnly": True, "workingType": "MARK_PRICE"})
+        tp_id = tp_order.get("id")
+    except Exception as exc:
+        log.error("Gagal pasang TP %s: %s", symbol, exc)
+    try:
+        sl_order = await EXCHANGE.create_order(
+            symbol, "STOP_MARKET", close_side, filled, None,
+            {"stopPrice": float(EXCHANGE.price_to_precision(symbol, sl)),
+             "reduceOnly": True, "workingType": "MARK_PRICE"})
+        sl_id = sl_order.get("id")
+    except Exception as exc:
+        log.error("Gagal pasang SL %s: %s", symbol, exc)
+
+    return {
+        "symbol": symbol, "side": side, "entry": entry, "amount": filled,
+        "tp": tp, "sl": sl, "tp_id": tp_id, "sl_id": sl_id,
+        "breakeven_done": False, "paper": False,
+        "opened_at": datetime.now(timezone.utc).isoformat(),
+        "order_id": order.get("id"),
+    }
+
+
+def posisi_paper(symbol: str, side: str, m: dict) -> dict:
+    entry = m["live"]
+    tp, sl = hitung_target(side, entry, m["atr"])
+    return {
+        "symbol": symbol, "side": side, "entry": entry,
+        "amount": notional_now() / entry,
+        "tp": tp, "sl": sl, "tp_id": None, "sl_id": None,
+        "breakeven_done": False, "paper": True,
+        "opened_at": datetime.now(timezone.utc).isoformat(),
+        "order_id": "PAPER",
+    }
+
+
+# ==============================================================================
+# 9. NOTIFIKASI
+# ==============================================================================
+
+
+def fmt(x: float) -> str:
+    if x >= 1000:
+        return f"{x:,.2f}"
+    if x >= 1:
+        return f"{x:,.4f}"
+    return f"{x:.6f}"
+
+
+GARIS = "━" * 26
+
+
+def bar_roi(pct: float, lebar: int = 10) -> str:
+    """Bar visual untuk ROI, dipakai di notifikasi close."""
+    penuh = min(int(abs(pct) / 2.0), lebar)      # 1 blok = 2% ROI
+    blok = ("▰" if pct >= 0 else "▰") * max(penuh, 1)
+    sisa = "▱" * (lebar - max(penuh, 1))
+    return blok + sisa
+
+
+def _mode_txt() -> str:
+    return "🧪 DRY-RUN" if DRY_RUN_MODE else "🔴 LIVE"
+
+
+def _ai_ringkas() -> str:
+    ikon = {"OK": "🟢", "READY": "⚪", "FALLBACK": "🟡",
+            "ERROR": "🔴", "NO KEY": "⚫", "OFF": "⚫"}
+    return (f"{ikon.get(AI_STATUS['kimi'], '⚪')} Kimi  "
+            f"{ikon.get(AI_STATUS['deepseek'], '⚪')} DeepSeek  "
+            f"{ikon.get(AI_STATUS['llama'], '⚪')} Llama")
+
+
+async def notif_entry(pos: dict, alasan: str):
+    stats = JOURNAL.stats(24)
+    arah = "🟢 LONG" if pos["side"] == "LONG" else "🔴 SHORT"
+    margin = (pos["entry"] * pos["amount"]) / max(LEVERAGE, 1)
+    jarak_sl = abs(pos["sl"] - pos["entry"]) / pos["entry"] * 100.0
+    msg = (
+        f"🚀 *ENTRY · {pos['symbol']} · {arah}*\n"
+        f"`{GARIS}`\n"
+        f"🧾 *Mode*   {_mode_txt()}\n"
+        f"💵 *Entry*  `{fmt(pos['entry'])}`\n"
+        f"📦 *Qty*    `{pos['amount']}`  ·  margin `${margin:,.2f}` x{LEVERAGE}\n"
+        f"🎯 *TP*     `{fmt(pos['tp'])}`  `+{TP_PCT*100:.2f}%` → bersih `+{TP_NET_PCT*100:.2f}%`\n"
+        f"🛡️ *SL*     `{fmt(pos['sl'])}`  `-{jarak_sl:.2f}%`  ({SL_ATR_MULT}×ATR)\n"
+        f"`{GARIS}`\n"
+        f"🧭 *Regime* {MARKET_REGIME_GLOBAL['market_regime']}\n"
+        f"🤖 {_ai_ringkas()}\n"
+        f"🧠 _{str(alasan)[:170]}_\n"
+        f"`{GARIS}`\n"
+        f"🎟️ Slot `{REGISTRY.slots_used()}/{MAX_OPEN_POSITIONS}`  ·  "
+        f"💰 Ekuitas `${equity_now():,.2f}`\n"
+        f"📊 24h `{stats['win']}W/{stats['loss']}L`  ·  "
+        f"WR `{stats['win_rate']:.1f}%`  ·  Net `{stats['pnl_usdt']:+.2f}`\n"
+        f"🆔 `{pos['order_id']}`"
+    )
+    await tg_send(msg)
+
+
+async def notif_close(trade: dict):
+    stats = JOURNAL.stats(24)
+    win = trade["pnl_usdt"] > 0
+    roi = trade["roi_pct"]
+    if win:
+        judul = "✅ *TAKE PROFIT*" if "TAKE PROFIT" in trade["reason"] else "✅ *CLOSED — WIN*"
+    else:
+        judul = "❌ *STOP LOSS*" if "STOP LOSS" in trade["reason"] else "❌ *CLOSED — LOSS*"
+    pf = stats["profit_factor"]
+    pf_txt = "∞" if pf == float("inf") else f"{pf:.2f}"
+    wr = stats["win_rate"]
+    tren = "📈" if stats["pnl_usdt"] >= 0 else "📉"
+    msg = (
+        f"{judul} · {trade['symbol']} · {trade['side']}\n"
+        f"`{GARIS}`\n"
+        f"`{bar_roi(roi)}`  *{roi:+.2f}%* ROI\n"
+        f"`{GARIS}`\n"
+        f"💵 Entry → Exit  `{fmt(trade['entry'])}` → `{fmt(trade['exit'])}`\n"
+        f"🏷️ Alasan       {trade['reason']}\n"
+        f"⏱️ Durasi       {trade['duration_min']:.1f} menit\n"
+        f"`{GARIS}`\n"
+        f"📐 Gross        `{trade.get('pnl_gross_usdt', 0.0):+.3f}` USDT "
+        f"({trade['pnl_pct']:+.3f}%)\n"
+        f"🧾 Fee          `-{trade.get('fee_usdt', 0.0):.3f}` USDT\n"
+        f"💰 *NET*        `{trade['pnl_usdt']:+.3f}` USDT\n"
+        f"`{GARIS}`\n"
+        f"{tren} *REKAP 24 JAM*\n"
+        f"├ W/L      `{stats['win']}W / {stats['loss']}L`\n"
+        f"├ Win rate `{wr:.1f}%`\n"
+        f"├ PF       `{pf_txt}`\n"
+        f"└ Net      `{stats['pnl_usdt']:+.2f}` USDT\n"
+        f"`{GARIS}`\n"
+        f"💰 Ekuitas `${equity_now():,.2f}` ({EQUITY['sumber']})  ·  "
+        f"🎟️ Slot `{REGISTRY.slots_used()}/{MAX_OPEN_POSITIONS}`\n"
+        f"🔒 Cooldown {trade['symbol']} `{REENTRY_COOLDOWN_SEC//60}m` · "
+        f"entry hari ini `{JOURNAL.reentries_today(trade['symbol'])}/{REENTRY_LIMIT_TXT}`"
+    )
+    await tg_send(msg)
+
+
+# --- Notifikasi siklus hidup bot: START / RESTART / STOP ---------------
+RUNTIME_FILE = env_str("RUNTIME_FILE", "runtime_v15.json")
+
+
+def runtime_load() -> dict:
+    try:
+        with open(RUNTIME_FILE, encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def runtime_save(data: dict):
+    try:
+        tmp = RUNTIME_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f)
+        os.replace(tmp, RUNTIME_FILE)
+    except Exception as exc:
+        log.warning("runtime_save gagal: %s", exc)
+
+
+async def notif_start(peringatan_txt: str = ""):
+    rt = runtime_load()
+    stop_terakhir = rt.get("last_stop")
+    restart = bool(stop_terakhir)
+    judul = "♻️ *BOT RESTART*" if restart else "🟢 *BOT START*"
+    jeda = ""
+    if restart:
+        try:
+            delta = (datetime.now(timezone.utc)
+                     - datetime.fromisoformat(stop_terakhir)).total_seconds()
+            jeda = f"\n⏸️ Mati selama `{int(delta // 60)}m {int(delta % 60)}s`"
+        except Exception:
+            jeda = ""
+    runtime_save({**rt, "last_start": datetime.now(timezone.utc).isoformat(),
+                  "last_stop": None})
+    n_tradfi = sum(1 for p in ASSET_PAIRS if is_tradfi(p))
+    msg = (
+        f"{judul} · V15.6 GENIUS\n"
+        f"`{GARIS}`\n"
+        f"🧾 Mode      {_mode_txt()}\n"
+        f"💰 Ekuitas   `${equity_now():,.2f}` ({EQUITY['sumber']})\n"
+        f"💵 Margin    `${margin_now():,.2f}`/trade · notional `${notional_now():,.2f}`\n"
+        f"🎟️ Slot      `{MAX_OPEN_POSITIONS}` · 1 posisi/pair · cd `{REENTRY_COOLDOWN_SEC//60}m`\n"
+        f"🪙 Pair      `{len(ASSET_PAIRS)}` ({len(ASSET_PAIRS)-n_tradfi} crypto + {n_tradfi} logam)\n"
+        f"🎯 TP/SL     `+{TP_PCT*100:.2f}%` → bersih `+{TP_NET_PCT*100:.2f}%` / `{SL_ATR_MULT}×ATR`\n"
+        f"🛡️ BE        trigger `{BREAKEVEN_TRIGGER_PCT*100:.2f}%` → kunci `+{BREAKEVEN_OFFSET_PCT*100:.2f}%`\n"
+        f"🏛️ TradFi    {status_pasar_tradfi()}\n"
+        f"🤖 {_ai_ringkas()}\n"
+        f"🖥️ UI        {'rich TUI' if TUI_MODE else 'log ringkas'}"
+        f"{jeda}"
+    )
+    if peringatan_txt:
+        msg += peringatan_txt
+    await tg_send(msg)
+
+
+async def notif_stop(alasan: str = "shutdown"):
+    s = JOURNAL.stats(24)
+    rt = runtime_load()
+    runtime_save({**rt, "last_stop": datetime.now(timezone.utc).isoformat()})
+    terbuka = ", ".join(REGISTRY.open.keys()) or "tidak ada"
+    msg = (
+        f"🛑 *BOT STOP* · V15.6 GENIUS\n"
+        f"`{GARIS}`\n"
+        f"🏷️ Alasan    {alasan}\n"
+        f"⏱️ Uptime    `{_uptime_txt()}`\n"
+        f"📊 24 jam    `{s['win']}W/{s['loss']}L` · WR `{s['win_rate']:.1f}%` · "
+        f"Net `{s['pnl_usdt']:+.2f}` USDT\n"
+        f"💰 Ekuitas   `${equity_now():,.2f}`\n"
+        f"📌 Posisi    {terbuka}\n"
+        f"`{GARIS}`\n"
+        f"_Posisi yang masih terbuka TIDAK ikut tertutup. Pantau manual di app._"
+    )
+    await tg_send(msg)
+
+
+# ==============================================================================
+# 10. SENSOR + PIPELINE ENTRY
+# ==============================================================================
+
+
+async def proses_pair(symbol: str, board: dict):
+    try:
+        m = await ambil_metrics(symbol)
+    except Exception as exc:
+        board[symbol] = f"⚪ OFFLINE/ERR ({str(exc)[:18]})"
+        return
+
+    barrier_up = m["open"] + (ATR_MULTIPLIER * m["atr"])
+    barrier_dn = m["open"] - (ATR_MULTIPLIER * m["atr"])
+    regime = MARKET_REGIME_GLOBAL["market_regime"]
+
+    side = None
+    rsi = m.get("rsi", 50.0)
+    rsi_trend = m.get("rsi_trend", 50.0)
+    touched_ob = m.get("touched_ob", False)
+    touched_os = m.get("touched_os", False)
+
+    # ============================================================
+    # MULTI-TF TREND FOLLOWING PULLBACK
+    # ============================================================
+    # TF 15m -> Trend confirmation (RSI 14)
+    # TF 5m  -> Entry trigger (RSI 5 + Stoch cross + touch zone)
+    # ============================================================
+
+    if regime in ("BEARISH_TREND", "DOWNTREND"):
+        trend_ok = rsi_trend < 55
+        if rsi > RSI_OB and touched_ob and m.get("dead_cross", False) and trend_ok:
+            side = "SHORT"
+            log.info("MTF SHORT %s RSI5=%.1f RSI15m=%.1f K=%.1f TZ:OB DC",
+                     symbol, rsi, rsi_trend, m["k"])
+
+    elif regime in ("BULLISH_TREND", "UPTREND"):
+        trend_ok = rsi_trend > 45
+        if rsi < RSI_OS and touched_os and m.get("golden_cross", False) and trend_ok:
+            side = "LONG"
+            log.info("MTF LONG %s RSI5=%.1f RSI15m=%.1f K=%.1f TZ:OS GC",
+                     symbol, rsi, rsi_trend, m["k"])
+
+    if side is None:
+        tag = "IN POSITION" if symbol in REGISTRY.open else "IDLE"
+        t_ob = "OB" if m.get("touched_ob") else ""
+        t_os = "OS" if m.get("touched_os") else ""
+        tz = t_ob or t_os or "-"
+        rsi_t = m.get("rsi_trend", 50.0)
+        board[symbol] = f"\u26aa  {tag} [K:{m['k']:.1f}|D:{m['d']:.1f}|R5:{rsi:.0f}|R15:{rsi_t:.0f}|TZ:{tz}|{regime[:4]}]"
+        return
+
+
+    # GATE JAM PASAR TRADFI: XAU/XAG/XPT dilarang entry saat pasar logam tutup
+    boleh_tradfi, alasan_tradfi = tradfi_boleh_entry(symbol)
+    if not boleh_tradfi:
+        board[symbol] = f"🌙 MARKET CLOSED ({alasan_tradfi})"
+        return
+
+    gate = REGISTRY.gate_reason(symbol)
+    if gate is not None:
+        log.info("GATE %s: %s", symbol, gate)
+        board[symbol] = f"🔒 {gate}"
+        return
+
+    REGISTRY.mark_signal(symbol)
+    if not await REGISTRY.reserve(symbol):
+        board[symbol] = "🔒 SLOT RACE"
+        return
+
+    board[symbol] = f"🚨 {side} SENSOR — AUDIT AI..."
+    try:
+        approved, alasan = await ai_alliance(symbol, side, m)
+        if not approved:
+            board[symbol] = f"❌ VETO: {str(alasan)[:22]}"
+            push_event("VETO", f"{symbol} {side} ditolak AI: {str(alasan)[:70]}")
+            await REGISTRY.release_pending(symbol)
+            return
+
+        if DRY_RUN_MODE:
+            pos = posisi_paper(symbol, side, m)
+        else:
+            pos = await eksekusi_order(symbol, side, m)  # notif hanya jika ini sukses
+
+        await REGISTRY.commit(symbol, pos)
+        await notif_entry(pos, alasan)
+        board[symbol] = f"🟢 OPEN {side} @ {fmt(pos['entry'])}"
+        push_event("ENTRY", f"{symbol} {side} @ {fmt(pos['entry'])} · qty {pos['amount']} · "
+                            f"slot {REGISTRY.slots_used()}/{MAX_OPEN_POSITIONS}")
+        log.info("ENTRY %s %s @ %s qty %s RSI5=%.1f K=%.1f D=%.1f",
+                  symbol, side, pos["entry"], pos["amount"], m.get("rsi", 0), m["k"], m["d"])
+    except Exception as exc:
+        await REGISTRY.release_pending(symbol)
+        board[symbol] = f"⛔ EXEC FAIL: {str(exc)[:20]}"
+        push_event("FAIL", f"{symbol} {side} gagal entry: {str(exc)[:70]}")
+        log.error("Eksekusi %s gagal: %s\n%s", symbol, exc, traceback.format_exc())
+        await tg_send(f"⚠️ *ENTRY GAGAL* `{symbol}` {side}\nAlasan: `{str(exc)[:250]}`\n"
+                      f"_Tidak ada posisi terbuka — notif sinyal dibatalkan._")
+
+
+# ==============================================================================
+# 11. POSITION WATCHER: breakeven + deteksi TP/SL + WIN/LOSS
+# ==============================================================================
+
+
+def hitung_pnl(pos: dict, exit_price: float):
+    """Kembalikan (pnl_pct_harga, gross_usdt, fee_usdt, net_usdt, roi_margin_pct).
+
+    Fee dihitung taker 2 sisi (buka + tutup) dari notional masing-masing sisi,
+    dan ROI dihitung dari margin nyata -- bukan pnl% x leverage yang menyesatkan.
+    """
+    if pos["side"] == "LONG":
+        pnl_pct = (exit_price - pos["entry"]) / pos["entry"]
+    else:
+        pnl_pct = (pos["entry"] - exit_price) / pos["entry"]
+    notional_in = pos["entry"] * pos["amount"]
+    notional_out = exit_price * pos["amount"]
+    gross = pnl_pct * notional_in
+    fee = (notional_in + notional_out) * FEE_TAKER_PCT
+    net = gross - fee
+    margin = notional_in / max(LEVERAGE, 1)
+    roi = (net / margin * 100.0) if margin > 0 else 0.0
+    return pnl_pct * 100.0, gross, fee, net, roi
+
+
+async def tutup_posisi(pos: dict, exit_price: float, reason: str):
+    symbol = pos["symbol"]
+    if not pos["paper"]:
+        try:
+            await EXCHANGE.cancel_all_orders(symbol)
+            log.info("Canceled all orders for %s", symbol)
+        except Exception as exc:
+            log.warning("cancel_all_orders %s: %s", symbol, exc)
+    pnl_pct, gross, fee, net, roi = hitung_pnl(pos, exit_price)
+    opened = datetime.fromisoformat(pos["opened_at"])
+    trade = {
+        "symbol": symbol, "side": pos["side"], "entry": pos["entry"], "exit": exit_price,
+        "amount": pos["amount"], "reason": reason, "paper": pos["paper"],
+        "pnl_pct": pnl_pct, "pnl_gross_usdt": gross, "fee_usdt": fee,
+        "pnl_usdt": net, "roi_pct": roi,
+        "opened_at": pos["opened_at"],
+        "closed_at": datetime.now(timezone.utc).isoformat(),
+        "duration_min": (datetime.now(timezone.utc) - opened).total_seconds() / 60.0,
+    }
+    JOURNAL.record_close(trade)
+    await REGISTRY.close(symbol)
+    await notif_close(trade)
+    push_event("WIN" if net > 0 else "LOSS",
+               f"{symbol} {pos['side']} {reason} · net {net:+.3f} USDT "
+               f"(gross {gross:+.3f} · fee {fee:.3f})")
+    log.info("CLOSE %s %s %s net %.4f USDT (gross %.4f fee %.4f)",
+             symbol, pos["side"], reason, net, gross, fee)
+
+
+async def paksa_market_close(pos: dict):
+    if pos["paper"]:
+        return
+    side = "sell" if pos["side"] == "LONG" else "buy"
+    try:
+        await EXCHANGE.create_order(pos["symbol"], "market", side, pos["amount"], None,
+                                    {"reduceOnly": True})
+    except Exception as exc:
+        log.error("Force close %s gagal: %s", pos["symbol"], exc)
+
+
+async def geser_breakeven(pos: dict):
+    """Pindahkan SL ke entry +/- offset setelah profit trigger."""
+    symbol, side = pos["symbol"], pos["side"]
+    new_sl = pos["entry"] * (1 + BREAKEVEN_OFFSET_PCT) if side == "LONG" \
+        else pos["entry"] * (1 - BREAKEVEN_OFFSET_PCT)
+    pos["sl"] = new_sl
+    pos["breakeven_done"] = True
+    push_event("BREAKEVEN", f"{symbol} {side} SL dikunci di {fmt(new_sl)}")
+    if pos["paper"]:
+        log.info("[PAPER] Breakeven guard %s -> %s", symbol, new_sl)
+        return
+    close_side = "sell" if side == "LONG" else "buy"
+    try:
+        if pos.get("sl_id"):
+            try:
+                await EXCHANGE.cancel_order(pos["sl_id"], symbol)
+            except Exception as exc:
+                log.warning("cancel SL lama %s: %s", symbol, exc)
+        order = await EXCHANGE.create_order(
+            symbol, "STOP_MARKET", close_side, pos["amount"], None,
+            {"stopPrice": float(EXCHANGE.price_to_precision(symbol, new_sl)),
+             "reduceOnly": True, "workingType": "MARK_PRICE"})
+        pos["sl_id"] = order.get("id")
+        await tg_send(f"🛡️ *BREAKEVEN GUARD LOCKED* `{symbol}` {side}\n"
+                      f"SL dipindah ke `{fmt(new_sl)}` (entry {BREAKEVEN_OFFSET_PCT*100:.2f}%)")
+    except Exception as exc:
+        log.error("Breakeven %s gagal: %s", symbol, exc)
+
+
+async def position_watcher():
+    while True:
+        try:
+            for symbol, pos in list(REGISTRY.open.items()):
+                try:
+                    ticker = await EXCHANGE.fetch_ticker(symbol)
+                    price = float(ticker.get("last") or ticker.get("close") or 0.0)
+                except Exception as exc:
+                    log.warning("ticker %s: %s", symbol, exc)
+                    continue
+                if price <= 0:
+                    continue
+                pos["last_price"] = price      # dipakai dashboard untuk PnL berjalan
+                side = pos["side"]
+
+                # TradFi: tutup paksa sebelum pasar logam tutup / masuk weekend
+                if TRADFI_FORCE_CLOSE and is_tradfi(symbol):
+                    masih_buka, alasan_pasar = cek_pasar_tradfi(TRADFI_FORCE_CLOSE_BUFFER_MIN)
+                    if not masih_buka:
+                        await paksa_market_close(pos)
+                        await tutup_posisi(pos, price, f"TRADFI MARKET CLOSE ({alasan_pasar})")
+                        continue
+
+                # Breakeven guard
+                if not pos["breakeven_done"]:
+                    moved = (price - pos["entry"]) / pos["entry"] if side == "LONG" \
+                        else (pos["entry"] - price) / pos["entry"]
+                    if moved >= BREAKEVEN_TRIGGER_PCT:
+                        await geser_breakeven(pos)
+
+                # V15.4: Cek exchange DULU sebelum putuskan TP/SL
+                if not pos["paper"]:
+                    still_open = await cek_posisi_bursa(symbol)
+                    if still_open is None:
+                        continue  # network error, skip
+                    if not still_open:
+                        # Posisi sudah close di exchange! Ambil harga riil
+                        actual_price = price
+                        try:
+                            trades = await EXCHANGE.fetch_my_trades(symbol, limit=5)
+                            if trades:
+                                # Cari trade terakhir yang reduce-only
+                                for t in reversed(trades):
+                                    if t.get("reduceOnly", False) or t.get("info", {}).get("reduceOnly", False):
+                                        actual_price = float(t.get("price") or price)
+                                        break
+                                if actual_price == price and trades:
+                                    actual_price = float(trades[-1].get("price") or price)
+                        except Exception as exc:
+                            log.warning("fetch_my_trades %s: %s", symbol, exc)
+                        # Tentukan reason berdasarkan harga riil
+                        if side == "LONG":
+                            reason = "TAKE PROFIT" if actual_price >= pos["entry"] else "STOP LOSS"
+                        else:
+                            reason = "TAKE PROFIT" if actual_price <= pos["entry"] else "STOP LOSS"
+                        if pos["breakeven_done"] and reason == "STOP LOSS":
+                            reason = "BREAKEVEN STOP"
+                        log.info("EXCHANGE_CLOSE %s %s price=%.6f reason=%s", 
+                                 symbol, side, actual_price, reason)
+                        await tutup_posisi(pos, actual_price, reason)
+                        continue
+
+                # Paper mode: pakai harga lokal
+                hit_tp = price >= pos["tp"] if side == "LONG" else price <= pos["tp"]
+                hit_sl = price <= pos["sl"] if side == "LONG" else price >= pos["sl"]
+                if hit_tp or hit_sl:
+                    reason = "TAKE PROFIT" if hit_tp else (
+                        "BREAKEVEN STOP" if pos["breakeven_done"] else "STOP LOSS")
+                    await tutup_posisi(pos, price, reason)
+                    continue
+
+                # Time stop
+                age = (datetime.now(timezone.utc)
+                       - datetime.fromisoformat(pos["opened_at"])).total_seconds()
+                if age > MAX_TRADE_AGE_SEC:
+                    await paksa_market_close(pos)
+                    await tutup_posisi(pos, price, "TIME STOP")
+        except Exception as exc:
+            log.error("watcher error: %s", exc)
+        await asyncio.sleep(2.0)
+
+
+async def cek_posisi_bursa(symbol: str):
+    try:
+        positions = await EXCHANGE.fetch_positions([symbol])
+        for p in positions:
+            if abs(float(p.get("contracts") or 0)) > 0:
+                return True
+        return False
+    except Exception as exc:
+        log.warning("cek_posisi_bursa %s: %s", symbol, exc)
+        return None
+
+
+
+async def force_cleanup_orphan():
+    """V15.4: Paksa bersihkan posisi yang sudah close tapi masih di registry."""
+    if DRY_RUN_MODE:
+        return
+    try:
+        positions = await EXCHANGE.fetch_positions()
+        live = {p["symbol"].replace(":USDT","") for p in positions
+                if abs(float(p.get("contracts") or 0)) > 0}
+        orphans = [s for s in REGISTRY.open if s.replace(":USDT","") not in live]
+        for symbol in orphans:
+            pos = REGISTRY.open[symbol]
+            price = pos.get("last_price", pos["entry"])
+            log.warning("ORPHAN CLEANUP: %s", symbol)
+            await tutup_posisi(pos, price, "ORPHAN CLEANUP")
+            push_event("CLEANUP", f"{symbol} orphan removed")
+        if orphans:
+            log.info("Cleaned %d orphan positions", len(orphans))
+    except Exception as exc:
+        log.error("force_cleanup gagal: %s", exc)
+
+async def sync_exchange_positions():
+    """Rekonsiliasi: kalau bursa sudah tidak punya posisi, lepaskan lock lokal."""
+    while True:
+        await asyncio.sleep(15.0)
+        if DRY_RUN_MODE:
+            continue
+        try:
+            positions = await EXCHANGE.fetch_positions()
+            live = {p["symbol"].replace(":USDT","") for p in positions
+                    if abs(float(p.get("contracts") or 0)) > 0}
+            # Run orphan cleanup every cycle
+            await force_cleanup_orphan()
+            # Cancel orders for pairs with no position
+            try:
+                positions = await EXCHANGE.fetch_positions()
+                live_syms = {p["symbol"].replace(":USDT","") for p in positions
+                             if abs(float(p.get("contracts") or 0)) > 0}
+            except Exception:
+                live_syms = set()
+            for symbol, pos in list(REGISTRY.open.items()):
+                # Normalize symbol for comparison
+                sym_clean = symbol.replace(":USDT", "")
+                if sym_clean not in live:
+                    try:
+                        ticker = await EXCHANGE.fetch_ticker(symbol)
+                        price = float(ticker.get("last") or pos.get("last_price") or pos["entry"])
+                    except Exception:
+                        price = pos.get("last_price", pos["entry"])
+                    log.info("SYNC: %s sudah tidak di exchange -> close", symbol)
+                    await tutup_posisi(pos, price, "CLOSED ON EXCHANGE")
+                else:
+                    # Position still live - update price
+                    try:
+                        ticker = await EXCHANGE.fetch_ticker(symbol)
+                        pos["last_price"] = float(ticker.get("last") or 0)
+                    except Exception:
+                        pass
+        except Exception as exc:
+            log.error("sync posisi gagal: %s", exc)
+
+
+# ==============================================================================
+# 12. WORKERS: kimi timer, morning briefing, dashboard
+# ==============================================================================
+
+
+async def kimi_timer_worker():
+    while True:
+        await agent1_kimi_macro()
+        await asyncio.sleep(KIMI_INTERVAL_SEC)
+
+
+async def morning_briefing_worker():
+    sent_for = None
+    while True:
+        now = datetime.now(WIB)
+        stamp = now.strftime("%Y-%m-%d")
+        if now.hour == BRIEFING_HOUR and now.minute == 0 and sent_for != stamp:
+            sent_for = stamp
+            s = JOURNAL.stats(24)
+            pf = "∞" if s["profit_factor"] == float("inf") else f"{s['profit_factor']:.2f}"
+            best = s["best"]
+            worst = s["worst"]
+            best_txt = f"{best['symbol']} ({best['pnl_pct']:+.2f}%)" if best else "-"
+            worst_txt = f"{worst['symbol']} ({worst['pnl_pct']:+.2f}%)" if worst else "-"
+            n_tradfi = sum(1 for p in ASSET_PAIRS if is_tradfi(p))
+            wr_bar = "▰" * int(s["win_rate"] // 10) + "▱" * (10 - int(s["win_rate"] // 10))
+            report = (
+                f"☀️ *MORNING BRIEFING* · {now.strftime('%d %b %Y')}\n"
+                f"`{GARIS}`\n"
+                f"⏰ {now.strftime('%H:%M')} WIB · periode 24 jam terakhir\n"
+                f"`{GARIS}`\n"
+                f"📊 *PERFORMA*\n"
+                f"├ Trade     `{s['total']}`\n"
+                f"├ W / L     `{s['win']}W / {s['loss']}L`\n"
+                f"├ Win rate  `{wr_bar}` `{s['win_rate']:.1f}%`\n"
+                f"└ PF        `{pf}`\n"
+                f"`{GARIS}`\n"
+                f"💰 *KEUANGAN*\n"
+                f"├ Gross     `{s.get('pnl_gross_usdt', 0.0):+.2f}` USDT\n"
+                f"├ Fee       `-{s.get('fee_usdt', 0.0):.2f}` USDT\n"
+                f"├ *NET*     `{s['pnl_usdt']:+.2f}` USDT\n"
+                f"└ Ekuitas   `${equity_now():,.2f}` ({EQUITY['sumber']})\n"
+                f"`{GARIS}`\n"
+                f"🔥 *LEADERBOARD*\n"
+                f"├ 🔼 Terbaik  {best_txt}\n"
+                f"└ 🔽 Terburuk {worst_txt}\n"
+                f"`{GARIS}`\n"
+                f"🧭 Regime    {MARKET_REGIME_GLOBAL['market_regime']}\n"
+                f"🏛️ TradFi    {status_pasar_tradfi()}\n"
+                f"🪙 Pair      `{len(ASSET_PAIRS)}` ({len(ASSET_PAIRS)-n_tradfi} crypto + {n_tradfi} logam)\n"
+                f"🎟️ Slot      `{REGISTRY.slots_used()}/{MAX_OPEN_POSITIONS}`\n"
+                f"🤖 {_ai_ringkas()}\n"
+                f"🧾 Mode      {_mode_txt()} · uptime `{_uptime_txt()}`"
+            )
+            await tg_send(report)
+        await asyncio.sleep(20.0)
+
+
+# ==============================================================================
+# 12B. UI ENGINE — rich TUI di terminal, log ringkas di PM2 (auto-detect)
+# ==============================================================================
+
+EVENT_FEED = deque(maxlen=14)
+BOOT_TS = datetime.now(timezone.utc)
+_LAST_HEARTBEAT = 0.0
+LIVE = None
+
+EVENT_IKON = {
+    "ENTRY": "🚀", "WIN": "✅", "LOSS": "❌", "VETO": "🛡",
+    "FAIL": "⚠", "BREAKEVEN": "🔒", "REGIME": "🧭", "MARKET": "🏛",
+    "INFO": "ℹ",
+}
+
+EVENT_STYLE = {
+    "ENTRY": "bold green",
+    "WIN": "bold bright_green",
+    "LOSS": "bold red",
+    "VETO": "yellow",
+    "FAIL": "bold red",
+    "BREAKEVEN": "cyan",
+    "REGIME": "magenta",
+    "MARKET": "blue",
+    "INFO": "white",
+}
+
+
+def push_event(kind: str, text: str):
+    """Catat kejadian penting. Di TUI masuk panel EVENT FEED, di PM2 jadi 1 baris log."""
+    ts = datetime.now(WIB).strftime("%H:%M:%S")
+    EVENT_FEED.append((ts, kind, text))
+    if not TUI_MODE:
+        ikon = EVENT_IKON.get(kind, "·")
+        print(f"  {ts}  {ikon}  {kind:<9} │ {text}", flush=True)
+
+
+def _uptime_txt() -> str:
+    secs = int((datetime.now(timezone.utc) - BOOT_TS).total_seconds())
+    hours, minutes = divmod(secs // 60, 60)
+    return f"{hours}j {minutes:02d}m"
+
+
+def _pnl_text(value: float, suffix: str = ""):
+    style = "bold green" if value > 0 else ("bold red" if value < 0 else "dim")
+    return Text(f"{value:+.2f}{suffix}", style=style)
+
+
+def _board_style(status: str) -> str:
+    if status.startswith("🟢"):
+        return "bold green"
+    if status.startswith("🚨"):
+        return "bold yellow"
+    if status.startswith("❌"):
+        return "red"
+    if status.startswith("⛔"):
+        return "bold red"
+    if status.startswith("🔒"):
+        return "yellow"
+    if status.startswith("🌙"):
+        return "blue"
+    return "dim"
+
+
+def _bar(nilai: int, total: int, lebar: int = 12) -> str:
+    total = max(total, 1)
+    isi = min(int(round(nilai / total * lebar)), lebar)
+    return "█" * isi + "░" * (lebar - isi)
+
+
+def _panel_header():
+    mode = "[bold black on green] DRY-RUN [/]" if DRY_RUN_MODE else "[bold white on red] LIVE [/]"
+    n_tradfi = sum(1 for p in ASSET_PAIRS if is_tradfi(p))
+    kiri = Text.assemble(
+        ("⚡ V15.6 ", "bold bright_cyan"),
+        ("GENIUS ENGINE", "bold white"),
+        ("  │  ", "dim"),
+        (f"{len(ASSET_PAIRS)} pair", "cyan"),
+        (f" ({len(ASSET_PAIRS)-n_tradfi}c+{n_tradfi}m)", "dim"),
+        ("  │  ", "dim"),
+        (f"TF {TIMEFRAME}", "cyan"),
+    )
+    kanan = Text.assemble(
+        (datetime.now(WIB).strftime("%d %b %H:%M:%S"), "bright_white"),
+        (" WIB  │  ", "dim"),
+        (f"⏱ {_uptime_txt()}", "cyan"),
+    )
+    grid = Table.grid(expand=True)
+    grid.add_column(justify="left", ratio=1)
+    grid.add_column(justify="center", width=12)
+    grid.add_column(justify="right", ratio=1)
+    grid.add_row(kiri, mode, kanan)
+    return Panel(grid, box=box.DOUBLE, border_style="bright_cyan", padding=(0, 1))
+
+
+def _panel_stats():
+    s = JOURNAL.stats(24)
+    pf = s["profit_factor"]
+    pf_txt = "∞" if pf == float("inf") else f"{pf:.2f}"
+    regime = MARKET_REGIME_GLOBAL["market_regime"]
+    reg_style = {"BULLISH_TREND": "bright_green", "BEARISH_TREND": "bright_red",
+                 "SIDEWAYS_CHOP": "yellow"}.get(regime, "white")
+    reg_ikon = {"BULLISH_TREND": "▲", "BEARISH_TREND": "▼",
+                "SIDEWAYS_CHOP": "◆"}.get(regime, "●")
+    p1 = Panel(f"[{reg_style}]{reg_ikon} {regime}[/]\n"
+               f"[dim]{MARKET_REGIME_GLOBAL['recommended_tactic']}[/]\n"
+               f"[dim]upd {MARKET_REGIME_GLOBAL['last_updated']}[/]",
+               title="🧭 KOMPAS KIMI", box=box.ROUNDED,
+               border_style=reg_style, padding=(0, 1))
+
+    used = REGISTRY.slots_used()
+    p2 = Panel(f"[bold bright_white]{used}[/][dim]/{MAX_OPEN_POSITIONS} slot[/]\n"
+               f"[cyan]{_bar(used, MAX_OPEN_POSITIONS)}[/]\n"
+               f"[dim]cd {REENTRY_COOLDOWN_SEC//60}m · re-entry {REENTRY_LIMIT_TXT}[/]",
+               title="🎟️  SLOT", box=box.ROUNDED,
+               border_style="cyan", padding=(0, 1))
+
+    wr = s["win_rate"]
+    wr_style = "bright_green" if wr >= 55 else ("yellow" if wr >= 45 else "bright_red")
+    net_style = "bold bright_green" if s["pnl_usdt"] >= 0 else "bold bright_red"
+    p3 = Panel(f"[green]{s['win']}W[/] [dim]/[/] [red]{s['loss']}L[/]  "
+               f"[{wr_style}]{wr:.0f}%[/]  [dim]PF[/] {pf_txt}\n"
+               f"[dim]fee[/] [red]-{s.get('fee_usdt', 0.0):.2f}[/]\n"
+               f"[{net_style}]{s['pnl_usdt']:+.2f} USDT[/]",
+               title="📊 24 JAM", box=box.ROUNDED,
+               border_style="magenta", padding=(0, 1))
+
+    eq_style = "bright_green" if EQUITY["sumber"] == "LIVE" else "yellow"
+    p4 = Panel(f"[{eq_style}]${equity_now():,.2f}[/] [dim]{EQUITY['sumber']}[/]\n"
+               f"[dim]margin[/] ${margin_now():,.2f} [dim]· notional[/] ${notional_now():,.0f}\n"
+               f"[dim]lev {LEVERAGE}x · upd {EQUITY['updated']}[/]",
+               title="💰 EKUITAS LIVE", box=box.ROUNDED,
+               border_style=eq_style, padding=(0, 1))
+
+    ikon = {"OK": "[green]●[/]", "READY": "[dim]○[/]", "FALLBACK": "[yellow]●[/]",
+            "ERROR": "[red]●[/]", "NO KEY": "[dim]○[/]", "OFF": "[dim]○[/]"}
+    p5 = Panel(f"{ikon.get(AI_STATUS['kimi'], '○')} Kimi K2.6\n"
+               f"{ikon.get(AI_STATUS['deepseek'], '○')} DeepSeek V4\n"
+               f"{ikon.get(AI_STATUS['llama'], '○')} Llama 3.3",
+               title="🤖 ALIANSI AI", box=box.ROUNDED,
+               border_style="bright_magenta", padding=(0, 1))
+
+    tradfi = status_pasar_tradfi()
+    p6 = Panel(f"{tradfi}\n"
+               f"[dim]TP {TP_PCT*100:.2f}% → net {TP_NET_PCT*100:.2f}%[/]\n"
+               f"[dim]SL {SL_ATR_MULT}×ATR · BE +{BREAKEVEN_OFFSET_PCT*100:.2f}%[/]",
+               title="🏛️  TRADFI & RISIKO", box=box.ROUNDED,
+               border_style="blue", padding=(0, 1))
+
+    return Columns([p1, p2, p3, p4, p5, p6], equal=True, expand=True)
+
+
+def _panel_positions():
+    if not REGISTRY.open:
+        return Panel(Align.center("[dim]— belum ada posisi terbuka —[/]"),
+                     title="📌 OPEN POSITIONS", box=box.ROUNDED,
+                     border_style="green", padding=(0, 1))
+    tabel = Table(expand=True, box=box.SIMPLE_HEAD, pad_edge=False,
+                  header_style="bold cyan", row_styles=["", "on grey11"])
+    for nama, rata in (("PAIR", "left"), ("SIDE", "center"), ("ENTRY", "right"),
+                       ("LAST", "right"), ("RSI5", "right"), ("TP", "right"), ("SL", "right"),
+                       ("PnL %", "right"), ("NET $", "right"), ("BE", "center"),
+                       ("AGE", "right")):
+        tabel.add_column(nama, justify=rata, no_wrap=True)
+    for sym, p in REGISTRY.open.items():
+        last = float(p.get("last_price") or p["entry"])
+        pnl_pct, _gross, _fee, net, _roi = hitung_pnl(p, last)
+        umur = (datetime.now(timezone.utc)
+                - datetime.fromisoformat(p["opened_at"])).total_seconds() / 60.0
+        panah = "▲" if p["side"] == "LONG" else "▼"
+        tabel.add_row(
+            Text(sym, style="bold white"),
+            Text(f"{panah} {p['side']}", style="green" if p["side"] == "LONG" else "red"),
+            fmt(p["entry"]), fmt(last), f"{p.get('rsi', 0):.1f}", fmt(p["tp"]), fmt(p["sl"]),
+            _pnl_text(pnl_pct, "%"), _pnl_text(net),
+            "[green]🛡[/]" if p["breakeven_done"] else "[dim]·[/]",
+            f"{umur:.0f}m",
+        )
+    return Panel(tabel, title=f"📌 OPEN POSITIONS ({len(REGISTRY.open)})",
+                 box=box.ROUNDED, border_style="green", padding=(0, 1))
+
+
+def _panel_radar(board: dict):
+    pairs = ASSET_PAIRS[:DASHBOARD_ROWS]
+    kolom = max(1, DASHBOARD_COLS)
+    baris = math.ceil(len(pairs) / kolom)
+    grid = Table.grid(expand=True, padding=(0, 2))
+    for _ in range(kolom):
+        grid.add_column(ratio=1)
+    for r in range(baris):
+        cells = []
+        for c in range(kolom):
+            idx = r + c * baris
+            if idx < len(pairs):
+                sym = pairs[idx]
+                status = board.get(sym, "⚪ INITIALIZING")
+                nama = sym.replace("/USDT", "")
+                gaya = _board_style(status)
+                cells.append(Text.assemble(
+                    (f"{nama:<6}", "bold bright_white" if is_tradfi(sym) else "white"),
+                    ("│ ", "dim"),
+                    (status[:30], gaya),
+                ))
+            else:
+                cells.append("")
+        grid.add_row(*cells)
+    return Panel(grid, title=f"⚡ RADAR SINYAL ({len(pairs)} pair)",
+                 box=box.ROUNDED, border_style="bright_black", padding=(0, 1))
+
+
+def _panel_events():
+    grid = Table.grid(expand=True, padding=(0, 1))
+    grid.add_column(width=8, no_wrap=True)
+    grid.add_column(width=3, no_wrap=True)
+    grid.add_column(width=10, no_wrap=True)
+    grid.add_column(ratio=1)
+    if not EVENT_FEED:
+        grid.add_row("", "", "", "[dim]menunggu kejadian pertama...[/]")
+    for ts, kind, text in list(EVENT_FEED)[-10:]:
+        grid.add_row(f"[dim]{ts}[/]",
+                     EVENT_IKON.get(kind, "·"),
+                     Text(kind, style=EVENT_STYLE.get(kind, "white")),
+                     Text(str(text)[:110], style="grey70"))
+    return Panel(grid, title="📰 EVENT FEED", box=box.ROUNDED,
+                 border_style="yellow", padding=(0, 1))
+
+
+def _panel_footer():
+    teks = Text.assemble(
+        ("🟢 sinyal  ", "green"), ("🔒 cooldown  ", "yellow"),
+        ("❌ veto AI  ", "red"), ("🌙 pasar tutup  ", "blue"),
+        ("⚪ idle", "dim"),
+        ("   │   ", "dim"), ("Ctrl+C untuk berhenti", "dim italic"),
+    )
+    return Align.center(teks)
+
+
+def build_dashboard(board: dict):
+    return Group(
+        _panel_header(),
+        _panel_stats(),
+        _panel_positions(),
+        _panel_radar(board),
+        _panel_events(),
+        _panel_footer(),
+    )
+
+
+def ui_start():
+    global LIVE
+    if not TUI_MODE:
+        log.info("UI: mode log ringkas (tty=%s, rich=%s)", IS_TTY, RICH_OK)
+        return
+    try:
+        LIVE = Live(Group(), console=CONSOLE, refresh_per_second=4, screen=True)
+        LIVE.start()
+    except Exception as exc:
+        LIVE = None
+        log.error("Gagal start TUI: %s -- lanjut mode log ringkas", exc)
+
+
+def ui_stop():
+    global LIVE
+    if LIVE is not None:
+        try:
+            LIVE.stop()
+        except Exception:
+            pass
+        LIVE = None
+
+
+def ui_render(board: dict):
+    """Dipanggil tiap akhir siklus scan."""
+    global _LAST_HEARTBEAT
+    if TUI_MODE and LIVE is not None:
+        try:
+            LIVE.update(build_dashboard(board))
+        except Exception as exc:
+            log.warning("render dashboard: %s", exc)
+        return
+    if HEARTBEAT_SEC <= 0:
+        return
+    now = datetime.now(timezone.utc).timestamp()
+    if now - _LAST_HEARTBEAT < HEARTBEAT_SEC:
+        return
+    _LAST_HEARTBEAT = now
+    s = JOURNAL.stats(24)
+    jam = datetime.now(WIB).strftime("%H:%M:%S")
+    print(
+        f"  {jam}  💓  HEARTBEAT │ "
+        f"slot {REGISTRY.slots_used()}/{MAX_OPEN_POSITIONS} · "
+        f"eq ${equity_now():,.2f} ({EQUITY['sumber']}) · "
+        f"margin ${margin_now():,.2f} · "
+        f"{MARKET_REGIME_GLOBAL['market_regime']} · "
+        f"24h {s['win']}W/{s['loss']}L WR {s['win_rate']:.1f}% net {s['pnl_usdt']:+.2f} · "
+        f"AI {AI_STATUS['kimi']}/{AI_STATUS['deepseek']}/{AI_STATUS['llama']} · "
+        f"TradFi {status_pasar_tradfi()}",
+        flush=True)
+
+
+# ==============================================================================
+# 13. MAIN LOOP
+# ==============================================================================
+
+
+STOP_EVENT = None
+STOP_SIGNAL = {"nama": "manual"}
+
+
+def _pasang_signal_handler():
+    """Tangkap SIGTERM/SIGINT (PM2 stop/restart) supaya bot pamit dulu."""
+    loop = asyncio.get_running_loop()
+
+    def _minta_berhenti(nama: str):
+        STOP_SIGNAL["nama"] = nama
+        if STOP_EVENT is not None and not STOP_EVENT.is_set():
+            STOP_EVENT.set()
+
+    for sig, nama in ((signal.SIGTERM, "SIGTERM"), (signal.SIGINT, "SIGINT")):
+        try:
+            loop.add_signal_handler(sig, _minta_berhenti, nama)
+        except Exception:
+            pass      # Windows / environment tanpa dukungan signal
+
+
+
+async def janitor_loop():
+    """Bersihkan orphan orders (regular + algo/TP/SL) HANYA jika posisi SUDAH TIDAK ADA"""
+    while True:
+        try:
+            await asyncio.sleep(120)
+
+            # Triple check posisi dengan delay
+            all_syms = set()
+            for check in range(3):
+                try:
+                    pos = await EXCHANGE.fetch_positions()
+                    for p in pos:
+                        amt = abs(float(p["info"].get("positionAmt", 0)))
+                        if amt > 0:
+                            raw = p["info"].get("symbol", "")
+                            if raw:
+                                all_syms.add(raw)
+                except Exception:
+                    pass
+                if check < 2:
+                    await asyncio.sleep(5)
+
+            act = all_syms
+            log.info("[JANITOR] Active positions: %s", act)
+
+            # Proses setiap pair
+            for pr in ASSET_PAIRS:
+                if isinstance(pr, str):
+                    sym_raw = pr
+                elif isinstance(pr, dict):
+                    sym_raw = pr.get("symbol", "")
+                else:
+                    sym_raw = getattr(pr, "symbol", "")
+                if not sym_raw:
+                    continue
+
+                # Normalisasi ke futures format
+                if ":" not in sym_raw and "/" in sym_raw:
+                    sym = sym_raw + ":USDT"
+                else:
+                    sym = sym_raw
+
+                # Cek market exists
+                try:
+                    mid = EXCHANGE.market(sym)["id"]
+                except Exception:
+                    continue
+
+                # SKIP jika ada posisi aktif
+                if mid in act:
+                    continue
+
+                had_orphan = False
+
+                # 1) Cancel regular orders
+                try:
+                    oo = await EXCHANGE.fetch_open_orders(sym)
+                    if oo:
+                        had_orphan = True
+                        log.info("[JANITOR] %d regular orders for %s", len(oo), mid)
+                        await EXCHANGE.cancel_all_orders(sym)
+                        log.info("[JANITOR] Cancelled %d regular orders %s", len(oo), mid)
+                except Exception as e:
+                    log.debug("[JANITOR] fetch orders %s: %s", mid, e)
+
+                # 2) Cancel algo orders (TP/SL) - INI YANG PENTING!
+                try:
+                    r = await EXCHANGE.request(
+                        "openAlgoOrders", "fapiPrivate", "GET",
+                        {"symbol": mid}
+                    )
+                    orders = r.get("orders", r) if isinstance(r, dict) else r
+                    if orders:
+                        had_orphan = True
+                        log.info("[JANITOR] %d algo orders for %s", len(orders), mid)
+                        for ao in orders:
+                            try:
+                                await EXCHANGE.request(
+                                    "algoOrder", "fapiPrivate", "DELETE",
+                                    {"symbol": mid, "algoId": ao["algoId"]}
+                                )
+                                log.info("[JANITOR] Cancelled algo %s #%s", mid, ao["algoId"])
+                            except Exception as e2:
+                                log.warning("[JANITOR] Error cancel algo %s: %s", ao.get("algoId", "?"), e2)
+                except Exception as e:
+                    log.debug("[JANITOR] algo check %s: %s", mid, e)
+
+                if had_orphan:
+                    log.info("[JANITOR] Cleaned %s (no position)", mid)
+
+        except Exception as e:
+            log.error("[JANITOR] Loop error: %s", e)
+
+
+
+async def main_loop():
+    global ASSET_PAIRS, STOP_EVENT
+    STOP_EVENT = asyncio.Event()
+    _pasang_signal_handler()
+    log.info("Boot V15.6 | pairs=%s | dry_run=%s | max_pos=%s",
+             len(ASSET_PAIRS), DRY_RUN_MODE, MAX_OPEN_POSITIONS)
+    try:
+        await EXCHANGE.load_markets()
+    except Exception as exc:
+        log.error("load_markets gagal: %s", exc)
+
+    # --- Cocokkan nama pair dengan yang benar-benar ada di bursa ---
+    try:
+        markets = EXCHANGE.markets or {}
+        if markets and AUTO_RESOLVE_PAIRS:
+            final, diganti, hilang = [], [], []
+            for p in ASSET_PAIRS:
+                nyata = resolve_symbol(p, markets)
+                if not nyata:
+                    hilang.append(p)
+                    continue
+                if nyata != p:
+                    diganti.append(f"{p}->{nyata}")
+                    if is_tradfi(p):
+                        TRADFI_PAIRS.add(nyata.upper())
+                final.append(nyata)
+            if diganti:
+                log.info("Pair disesuaikan: %s", ", ".join(diganti))
+                push_event("MARKET", f"{len(diganti)} pair disesuaikan namanya")
+            if hilang:
+                log.warning("Pair tidak ada di bursa, dilewati: %s", ", ".join(hilang))
+                push_event("MARKET", f"{len(hilang)} pair dilewati: {', '.join(hilang)}")
+            ASSET_PAIRS = final
+            if not ASSET_PAIRS:
+                log.error("Semua pair invalid, bot berhenti.")
+                return
+    except Exception as exc:
+        log.error("Filter pair gagal: %s", exc)
+
+    await refresh_equity(diam=False)
+    log.info("Ekuitas %s: $%.2f | margin/trade $%.2f | notional $%.2f",
+             EQUITY["sumber"], equity_now(), margin_now(), notional_now())
+
+    # --- Audit setelan: cegah konfigurasi yang matematis merugi ---
+    peringatan = []
+    if TP_NET_PCT <= 0:
+        peringatan.append(
+            f"TP {TP_PCT*100:.3f}% <= fee bolak-balik {FEE_ROUNDTRIP_PCT*100:.3f}% → "
+            "setiap WIN tetap RUGI.")
+    elif TP_NET_PCT < FEE_ROUNDTRIP_PCT:
+        peringatan.append(
+            f"TP bersih cuma {TP_NET_PCT*100:.3f}% sedangkan fee {FEE_ROUNDTRIP_PCT*100:.3f}% → "
+            "butuh win rate ekstrem untuk impas.")
+    if BREAKEVEN_OFFSET_PCT <= FEE_ROUNDTRIP_PCT:
+        peringatan.append(
+            f"BREAKEVEN_OFFSET {BREAKEVEN_OFFSET_PCT*100:.3f}% <= fee "
+            f"{FEE_ROUNDTRIP_PCT*100:.3f}% → breakeven stop tetap rugi.")
+    margin_dibutuhkan = margin_now() * MAX_OPEN_POSITIONS
+    batas_aman = equity_now() * EQUITY_SAFETY_PCT
+    if margin_dibutuhkan > batas_aman:
+        peringatan.append(
+            f"Butuh ${margin_dibutuhkan:.2f} margin untuk {MAX_OPEN_POSITIONS} slot, "
+            f"tapi batas aman cuma ${batas_aman:.2f} dari ekuitas ${equity_now():.2f} → "
+            "posisi terakhir bisa ditolak bursa.")
+    for w in peringatan:
+        log.warning(w)
+        push_event("FAIL", w)
+    risiko_txt = ""
+    if peringatan:
+        risiko_txt = "\n⚠\ufe0f *PERINGATAN SETELAN*\n" + "\n".join(f"• {w}" for w in peringatan)
+
+    await notif_start(risiko_txt)
+
+    # V15.4: Clean orphan positions on boot
+    await force_cleanup_orphan()
+    tasks = [
+        asyncio.create_task(equity_worker()),
+        asyncio.create_task(kimi_timer_worker()),
+        asyncio.create_task(morning_briefing_worker()),
+        asyncio.create_task(position_watcher()),
+        asyncio.create_task(sync_exchange_positions()),
+        asyncio.create_task(janitor_loop()),
+    ]
+    board = {}
+    ui_start()
+    push_event("INFO", f"Engine online · {len(ASSET_PAIRS)} pair · "
+                       f"{'DRY-RUN' if DRY_RUN_MODE else 'LIVE'}")
+    alasan_stop = "shutdown"
+    try:
+        while not STOP_EVENT.is_set():
+            await asyncio.gather(*[proses_pair(p, board) for p in ASSET_PAIRS],
+                                 return_exceptions=True)
+            ui_render(board)
+            try:
+                await asyncio.wait_for(STOP_EVENT.wait(), timeout=SCAN_INTERVAL)
+            except asyncio.TimeoutError:
+                pass
+        alasan_stop = f"sinyal {STOP_SIGNAL['nama']}"
+    except asyncio.CancelledError:
+        alasan_stop = "dibatalkan"
+        raise
+    except Exception as exc:
+        alasan_stop = f"crash: {exc}"
+        log.error("main_loop crash: %s\n%s", exc, traceback.format_exc())
+        raise
+    finally:
+        ui_stop()
+        for t in tasks:
+            t.cancel()
+        try:
+            await notif_stop(alasan_stop)
+        except Exception as exc:
+            log.warning("notif_stop gagal: %s", exc)
+        try:
+            await EXCHANGE.close()
+        except Exception:
+            pass
+
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main_loop())
+    except KeyboardInterrupt:
+        print("\n🛑 Bot dihentikan oleh user.")

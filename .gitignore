@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+*.log
+.env
+.env.*
+.env.bak*
+*.bak
+paper_venv/
+node_modules/
+.DS_Store
+*.zip
+state_v15.json
+runtime_v15.json

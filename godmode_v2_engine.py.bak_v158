@@ -1,0 +1,748 @@
+"""
+GODMODE V2 ENGINE - FASE 1
+"""
+import json, re, asyncio, logging
+import numpy as np
+import pandas as pd
+from datetime import datetime, timezone, timedelta
+
+log = logging.getLogger("GMv2")
+WIB = timezone(timedelta(hours=7))
+
+FEATURE_WEIGHTS = {
+    "trend": 25, "momentum": 20, "mtf_alignment": 15,
+    "liquidity": 15, "volume": 10, "volatility": 10, "session": 5,
+}
+
+TIER_THRESHOLDS = {"sniper": 95, "execute": 85, "watch": 60, "reject": 0}
+
+# ---- JSON EXTRACTOR (bracket counting) ----
+def extract_json_robust(text):
+    if not text:
+        return {}
+    text = text.strip()
+    try:
+        return json.loads(text)
+    except Exception:
+        pass
+    depth, start = 0, -1
+    for i, ch in enumerate(text):
+        if ch == "{":
+            if depth == 0: start = i
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0 and start != -1:
+                try:
+                    return json.loads(text[start:i+1])
+                except Exception:
+                    start = -1
+    try:
+        m = re.search(r"\{.*\}", text, re.DOTALL)
+        if m: return json.loads(m.group(0))
+    except Exception:
+        pass
+    return {}
+
+def safe_float(v, d=50.0):
+    try: return float(v)
+    except: return d
+
+def safe_int(v, d=50):
+    try: return int(float(v))
+    except: return d
+
+# ---- FEATURE ENGINE ----
+class FeatureEngine:
+    def compute(self, df_5m, df_15m):
+        if len(df_5m) < 50 or len(df_15m) < 20:
+            return self._empty()
+        try:
+            r = {}
+            r.update(self._trend(df_5m))
+            r.update(self._momentum(df_5m))
+            r.update(self._volatility(df_5m))
+            r.update(self._volume(df_5m))
+            r.update(self._mtf(df_5m, df_15m))
+            r.update(self._structure(df_5m))
+            r.update(self._session())
+            r["_price"] = float(df_5m["close"].iloc[-1])
+            return r
+        except Exception as e:
+            log.warning("FeatureEngine: %s", e)
+            return self._empty()
+
+    def _empty(self):
+        return {k: 50.0 for k in [
+            "trend_score","momentum_score","mtf_alignment_score",
+            "volatility_score","volume_score","session_score",
+            "rsi5","stoch_k","stoch_k_15m","atr_pct","atr_percentile",
+            "volume_ratio","structure_score","near_support","near_resistance",
+            "ema_slope","rsi_slope","macd_hist","bb_width","_price"
+        ]}
+
+    def _rsi(self, s, p=5):
+        d = s.diff()
+        g = d.where(d > 0, 0.0).rolling(p).mean()
+        l = (-d.where(d < 0, 0.0)).rolling(p).mean()
+        return 100.0 - 100.0 / (1.0 + g / (l + 1e-9))
+
+    def _stoch_rsi(self, s, p=7, sk=3, sd=3):
+        rsi = self._rsi(s, p)
+        rmin = rsi.rolling(p).min()
+        rmax = rsi.rolling(p).max()
+        stoch = (rsi - rmin) / (rmax - rmin + 1e-9) * 100
+        k = stoch.rolling(sk).mean()
+        d = k.rolling(sd).mean()
+        return float(k.iloc[-1]), float(d.iloc[-1])
+
+    def _trend(self, df):
+        c = df["close"]
+        p = float(c.iloc[-1])
+        e20 = float(c.ewm(span=20).mean().iloc[-1])
+        e50 = float(c.ewm(span=50).mean().iloc[-1])
+        if p > e20 > e50: al = 80
+        elif p < e20 < e50: al = 20
+        else: al = 50
+        slope = (e20 - float(c.ewm(span=20).mean().iloc[-5])) / e20 * 10000
+        slope_s = 50 + np.clip(slope * 5, -50, 50)
+        score = np.clip(al * 0.6 + slope_s * 0.4, 0, 100)
+        return {"trend_score": round(float(score),1), "ema_slope": round(float(slope_s),1)}
+
+    def _momentum(self, df):
+        c = df["close"]
+        rsi = float(self._rsi(c, 5).iloc[-1])
+        rsi_s = float(self._rsi(c, 5).iloc[-1] - self._rsi(c, 5).iloc[-3]) if len(c) > 5 else 0
+        sk, sd = self._stoch_rsi(c)
+        e12 = c.ewm(span=12).mean()
+        e26 = c.ewm(span=26).mean()
+        h = (e12 - e26) - (e12 - e26).ewm(span=9).mean()
+        return {"rsi5": round(rsi,1), "rsi_slope": round(rsi_s,2),
+                "stoch_k": round(sk,1), "stoch_d": round(sd,1),
+                "macd_hist": round(float(h.iloc[-1]),6),
+                "momentum_score": round(rsi,1)}
+
+    def _volatility(self, df):
+        h, l, c = df["high"], df["low"], df["close"]
+        tr = pd.concat([h-l, (h-c.shift(1)).abs(), (l-c.shift(1)).abs()], axis=1).max(axis=1)
+        atr = float(tr.rolling(14).mean().iloc[-1])
+        p = float(c.iloc[-1])
+        atr_pct = atr / p * 100 if p > 0 else 0
+        atr_s = tr.rolling(14).mean()
+        atr_pctl = float((atr_s.iloc[-1] > atr_s).sum() / len(atr_s) * 100)
+        sma = c.rolling(20).mean()
+        std = c.rolling(20).std()
+        bbw = float(((sma + 2*std).iloc[-1] - (sma - 2*std).iloc[-1]) / sma.iloc[-1] * 100)
+        return {"atr": round(atr,6), "atr_pct": round(atr_pct,4),
+                "atr_percentile": round(atr_pctl,1), "bb_width": round(bbw,2),
+                "volatility_score": round(np.clip(atr_pctl,0,100),1)}
+
+    def _volume(self, df):
+        v = df["volume"]
+        r = float(v.iloc[-1]) / (float(v.rolling(20).mean().iloc[-1]) + 1e-9)
+        return {"volume_ratio": round(r,2), "volume_spike": r > 1.5,
+                "volume_score": round(float(np.clip(r*40,0,100)),1)}
+
+    def _mtf(self, df5, df15):
+        r5 = float(self._rsi(df5["close"], 5).iloc[-1])
+        r15 = float(self._rsi(df15["close"], 14).iloc[-1])
+        sk15, _ = self._stoch_rsi(df15["close"])
+        e20_5 = float(df5["close"].ewm(span=20).mean().iloc[-1])
+        e20_15 = float(df15["close"].ewm(span=20).mean().iloc[-1])
+        p = float(df5["close"].iloc[-1])
+        a5 = p > e20_5
+        a15 = p > e20_15
+        if a5 and a15: ms = 80
+        elif not a5 and not a15: ms = 20
+        else: ms = 50
+        return {"mtf_alignment_score": round(float(ms),1),
+                "rsi_15m": round(r15,1), "stoch_k_15m": round(sk15,1)}
+
+    def _structure(self, df):
+        h, l, p = df["high"].values, df["low"].values, float(df["close"].iloc[-1])
+        sh, sl = [], []
+        for i in range(2, len(df)-2):
+            if h[i]>h[i-1] and h[i]>h[i-2] and h[i]>h[i+1] and h[i]>h[i+2]: sh.append(h[i])
+            if l[i]<l[i-1] and l[i]<l[i-2] and l[i]<l[i+1] and l[i]<l[i+2]: sl.append(l[i])
+        ns = max(0, 100 - min(abs(p-s)/p*20000 for s in sl[-3:]) if sl else 0)
+        nr = max(0, 100 - min(abs(p-r)/p*20000 for r in sh[-3:]) if sh else 0)
+        sc = 50
+        if len(sh)>=2 and len(sl)>=2:
+            if sh[-1]>sh[-2] and sl[-1]>sl[-2]: sc = 75
+            elif sh[-1]<sh[-2] and sl[-1]<sl[-2]: sc = 25
+        return {"structure_score": round(sc,1), "near_support": round(ns,1),
+                "near_resistance": round(nr,1)}
+
+    def _session(self):
+        h = datetime.now(WIB).hour
+        if 15<=h<21: return {"session":"LONDON","session_score":90}
+        elif 21<=h or h<3: return {"session":"NEW_YORK","session_score":85}
+        elif 3<=h<7: return {"session":"OVERLAP","session_score":95}
+        else: return {"session":"ASIA","session_score":70}
+
+FEATURE_ENGINE = FeatureEngine()
+
+# ==============================================================================
+# GODMODE V2 SCORING ENGINE
+# ==============================================================================
+class GodModeScorer:
+    def __init__(self):
+        self.weights = dict(FEATURE_WEIGHTS)
+
+    def score(self, features: dict, direction: str) -> tuple:
+        """Return (score 0-100, tier_label, breakdown_dict)."""
+        w = self.weights
+        breakdown = {}
+
+        # TREND (0-100 from features)
+        raw_trend = features.get("trend_score", 50)
+        if direction == "LONG":
+            breakdown["trend"] = raw_trend
+        else:
+            breakdown["trend"] = 100 - raw_trend
+
+        # MOMENTUM
+        rsi = features.get("rsi5", 50)
+        slope = features.get("rsi_slope", 0)
+        if direction == "LONG":
+            mom = (100 - rsi) * 0.6 + max(0, slope * 10 + 50) * 0.4
+        else:
+            mom = rsi * 0.6 + max(0, -slope * 10 + 50) * 0.4
+        breakdown["momentum"] = np.clip(mom, 0, 100)
+
+        # MTF ALIGNMENT
+        mtf = features.get("mtf_alignment_score", 50)
+        if direction == "LONG":
+            breakdown["mtf_alignment"] = mtf
+        else:
+            breakdown["mtf_alignment"] = 100 - mtf
+
+        # LIQUIDITY
+        ns = features.get("near_support", 0)
+        nr = features.get("near_resistance", 0)
+        if direction == "LONG":
+            breakdown["liquidity"] = np.clip(ns, 0, 100)
+        else:
+            breakdown["liquidity"] = np.clip(nr, 0, 100)
+
+        # VOLUME
+        vs = features.get("volume_score", 50)
+        spike = features.get("volume_spike", False)
+        breakdown["volume"] = min(100, vs + (15 if spike else 0))
+
+        # VOLATILITY
+        vol = features.get("volatility_score", 50)
+        atr_pct = features.get("atr_pct", 0.1)
+        # Sweet spot: not too low (dead), not too high (chaos)
+        if 0.05 < atr_pct < 0.3:
+            breakdown["volatility"] = 70
+        elif atr_pct < 0.05:
+            breakdown["volatility"] = 30  # too quiet
+        else:
+            breakdown["volatility"] = 40  # too wild
+        breakdown["volatility"] = (breakdown["volatility"] + vol) / 2
+
+        # SESSION
+        breakdown["session"] = features.get("session_score", 50)
+
+        # WEIGHTED TOTAL
+        total = 0
+        for key, weight in w.items():
+            total += breakdown.get(key, 50) * (weight / 100.0)
+
+        score = np.clip(total, 0, 100)
+
+        # Tier label
+        if score >= TIER_THRESHOLDS["sniper"]:
+            tier = "SNIPER"
+        elif score >= TIER_THRESHOLDS["execute"]:
+            tier = "EXECUTE"
+        elif score >= TIER_THRESHOLDS["watch"]:
+            tier = "WATCH"
+        else:
+            tier = "REJECT"
+
+        return round(float(score), 1), tier, breakdown
+
+    def best_direction(self, features: dict) -> tuple:
+        """Return (direction, score, tier, breakdown) for the best side."""
+        sc_l, tl, bl = self.score(features, "LONG")
+        sc_s, ts, bs = self.score(features, "SHORT")
+        if sc_l > sc_s:
+            return "LONG", sc_l, tl, bl
+        elif sc_s > sc_l:
+            return "SHORT", sc_s, ts, bs
+        else:
+            return "NEUTRAL", sc_l, tl, bl
+
+GM_SCORER = GodModeScorer()
+
+# ==============================================================================
+# ATHENA - Market Intelligence (Agent 1)
+# ==============================================================================
+ATHENA_SYSTEM = "Analyze market data. Reply ONLY with JSON: {\"market_regime\": \"TRENDING_UP\" or \"TRENDING_DOWN\" or \"CHOPPY\", \"bias\": \"LONG_LEANING\" or \"SHORT_LEANING\" or \"NEUTRAL\", \"confidence\": 0-100}"
+
+async def run_athena(client, model, btc_data, eth_data, funding, oi_change, session):
+    """Run ATHENA agent. Return dict or default."""
+    prompt = f"""INPUT:
+BTC: trend={btc_data.get("trend","?")} ema={btc_data.get("ema_alignment","?")} atr_pctl={btc_data.get("atr_percentile",50)}
+ETH: trend={eth_data.get("trend","?")} ema={eth_data.get("ema_alignment","?")} atr_pctl={eth_data.get("atr_percentile",50)}
+Funding aggregate: {funding}
+OI change %: {oi_change}
+Session: {session}"""
+
+    default = {
+        "market_regime": "CHOPPY",
+        "bias": "NEUTRAL",
+        "bias_strength": 50,
+        "volatility_state": "NORMAL",
+        "session_quality": 50,
+        "confidence": 30,
+        "reasoning": "fallback - AI unavailable",
+        "warnings": ["athena_fallback"],
+    }
+
+    if client is None:
+        return default
+
+    try:
+        res = await asyncio.to_thread(
+            client.chat.completions.create,
+            model=model,
+            messages=[
+                {"role": "system", "content": ATHENA_SYSTEM},
+                {"role": "user", "content": prompt},
+            ],
+            max_tokens=1500,
+            temperature=0.1,
+        )
+        # V16: DeepSeek Distill kadang taruh output di reasoning_content
+        msg = res.choices[0].message
+        raw = msg.content
+        if raw is None and hasattr(msg, "reasoning_content"):
+            raw = msg.reasoning_content
+        if raw is None:
+            # Coba ambil dari seluruh response
+            raw = str(msg)
+        log.info("ATHENA_RAW: %s", str(raw)[:300])
+        data = extract_json_robust(raw)
+        if not data:
+            log.warning("ATHENA: empty response, raw=%s", str(raw)[:200])
+            return default
+        data.setdefault("confidence", 30)
+        data.setdefault("market_regime", "CHOPPY")
+        data.setdefault("bias", "NEUTRAL")
+        return data
+    except Exception as e:
+        log.error("ATHENA error: %s", e)
+        return default
+
+# ==============================================================================
+# HERMES - Setup Probability Analyst (Agent 2)
+# ==============================================================================
+HERMES_SYSTEM = """You are HERMES, Setup Probability Analyst. You evaluate ONE pair using pre-computed normalized features. You do not see raw charts. Called only after GodMode score cleared threshold. Your job is independent statistical read.
+
+RULES:
+1. Reason only from features and market_context given. Never assume.
+2. If features conflict (trend high but volume low), reflect conflict in lower setup_score.
+3. Set late_entry=true if momentum suggests move already extended.
+4. Never use absolute language.
+5. strengths/weaknesses: max 3 items, each <= 12 words.
+
+Return ONLY this JSON:
+{
+  "setup_score": 0-100,
+  "probability_estimate": 0-100,
+  "expected_rr": number,
+  "late_entry": true|false,
+  "strengths": ["string"],
+  "weaknesses": ["string"],
+  "confidence": 0-100
+}"""
+
+async def run_hermes(client, model, symbol, direction, features, market_ctx):
+    """Run HERMES. Return dict or empty (fail-closed)."""
+    prompt = f"""INPUT:
+Symbol: {symbol}
+Direction: {direction}
+Features: {json.dumps({k: v for k, v in features.items() if not k.startswith("_")})}
+Market Context: {json.dumps(market_ctx)}"""
+
+    empty = {"setup_score": 0, "probability_estimate": 0, "expected_rr": 0,
+             "late_entry": True, "strengths": [], "weaknesses": ["AI unavailable"],
+             "confidence": 0}
+
+    if client is None:
+        log.warning("HERMES: client None -> fail-closed")
+        return empty
+
+    try:
+        res = await asyncio.to_thread(
+            client.chat.completions.create,
+            model=model,
+            messages=[
+                {"role": "system", "content": HERMES_SYSTEM},
+                {"role": "user", "content": prompt},
+            ],
+            max_tokens=300,
+            temperature=0.15,
+        )
+        raw = res.choices[0].message.content
+        data = extract_json_robust(raw)
+        if not data or "setup_score" not in data:
+            log.warning("HERMES %s: invalid response", symbol)
+            return empty
+        data.setdefault("confidence", 0)
+        data.setdefault("late_entry", True)
+        return data
+    except Exception as e:
+        log.error("HERMES %s error: %s", symbol, e)
+        return empty
+
+# ==============================================================================
+# AEGIS - Chief Risk Officer (Agent 3)
+# ==============================================================================
+AEGIS_SYSTEM = """You are AEGIS, Risk Officer for 75x leverage crypto futures. 1.3% adverse move = total liquidation. Default assumption: every trade is WRONG until evidence says otherwise. Your job is FIND REASONS TO REJECT.
+
+RULES:
+1. If evidence inconclusive or thin, REJECT. Need positive case that risk is acceptable.
+2. If your confidence < 50, approve=false regardless of risk_score.
+3. rejection_reasons must be non-empty when approve=false. Max 3 reasons, each <= 15 words.
+4. Never use absolute language.
+
+WHAT TO HUNT:
+- Liquidity trap / stop-hunt
+- False breakout
+- Momentum exhaustion
+- Timeframe conflict (5m vs 15m)
+- Spread/orderbook risk
+- Session transition
+- Funding extremes
+
+Return ONLY this JSON:
+{
+  "approve": true|false,
+  "risk_score": 0-100,
+  "trap_probability": 0-100,
+  "rejection_reasons": ["string"],
+  "confidence": 0-100
+}"""
+
+async def run_aegis(client, model, symbol, direction, features, market_ctx, hermes_out, spread_bps, ob_imbalance):
+    """Run AEGIS. Default = REJECT (fail-closed)."""
+    prompt = f"""INPUT:
+Symbol: {symbol}
+Direction: {direction}
+Leverage: 75
+Spread (bps): {spread_bps}
+Orderbook imbalance: {ob_imbalance}
+Features: {json.dumps({k: v for k, v in features.items() if not k.startswith("_")})}
+Market Context: {json.dumps(market_ctx)}
+HERMES output: {json.dumps(hermes_out)}"""
+
+    reject = {"approve": False, "risk_score": 100, "trap_probability": 100,
+              "rejection_reasons": ["AI unavailable - fail-closed"], "confidence": 0}
+
+    if client is None:
+        log.warning("AEGIS: client None -> fail-closed REJECT")
+        return reject
+
+    try:
+        res = await asyncio.to_thread(
+            client.chat.completions.create,
+            model=model,
+            messages=[
+                {"role": "system", "content": AEGIS_SYSTEM},
+                {"role": "user", "content": prompt},
+            ],
+            max_tokens=300,
+            temperature=0.1,
+        )
+        raw = res.choices[0].message.content
+        data = extract_json_robust(raw)
+        if not data or "approve" not in data:
+            log.warning("AEGIS %s: invalid response -> REJECT", symbol)
+            return reject
+        data.setdefault("confidence", 0)
+        data.setdefault("rejection_reasons", [])
+        return data
+    except Exception as e:
+        log.error("AEGIS %s error: %s -> REJECT", symbol, e)
+        return reject
+
+# ==============================================================================
+# CONSENSUS ENGINE
+# ==============================================================================
+class ConsensusEngine:
+    def evaluate(self, gm_score, gm_tier, athena, hermes, aegis):
+        """Combine all scores into final decision."""
+        result = {
+            "godmode_score": gm_score,
+            "godmode_tier": gm_tier,
+            "athena_confidence": safe_int(athena.get("confidence", 0)),
+            "hermes_score": safe_int(hermes.get("setup_score", 0)),
+            "hermes_probability": safe_int(hermes.get("probability_estimate", 0)),
+            "aegis_approve": aegis.get("approve", False),
+            "aegis_risk": safe_int(aegis.get("risk_score", 100)),
+            "aegis_trap": safe_int(aegis.get("trap_probability", 100)),
+        }
+
+        scores = [gm_score]
+        weights = [40]  # GodMode = 40%
+
+        hs = safe_float(hermes.get("setup_score", 0))
+        scores.append(hs)
+        weights.append(30)  # HERMES = 30%
+
+        ar = safe_float(aegis.get("risk_score", 100))
+        risk_inverse = 100 - ar
+        scores.append(risk_inverse)
+        weights.append(30)  # AEGIS risk inverse = 30%
+
+        total_w = sum(weights)
+        consensus = sum(s * w for s, w in zip(scores, weights)) / total_w
+
+        result["consensus_score"] = round(consensus, 1)
+
+        # Decision - DUAL PATH: Sniper (95+) vs Balanced (85-94)
+        if not aegis.get("approve", False):
+            result["decision"] = "REJECT"
+            result["reason"] = "AEGIS VETO: " + "; ".join(aegis.get("rejection_reasons", ["unknown"])[:2])
+        elif hermes.get("late_entry", True):
+            result["decision"] = "REJECT"
+            result["reason"] = "HERMES: late entry detected"
+        elif consensus >= 95:
+            result["decision"] = "SNIPER"
+            result["reason"] = f"SNIPER PATH - Ultra high consensus ({consensus:.1f})"
+            result["path"] = "SNIPER"
+            result["size_multiplier"] = 1.2
+        elif consensus >= 85:
+            result["decision"] = "EXECUTE"
+            result["reason"] = f"BALANCED PATH - Good consensus ({consensus:.1f})"
+            result["path"] = "BALANCED"
+            result["size_multiplier"] = 1.0
+        elif consensus >= 70:
+            result["decision"] = "WATCH"
+            result["reason"] = f"Watchlist only ({consensus:.1f}) - monitor for better entry"
+            result["path"] = "WATCH"
+            result["size_multiplier"] = 0
+        else:
+            result["decision"] = "REJECT"
+            result["reason"] = f"Low consensus ({consensus:.1f}) - skip"
+            result["path"] = "REJECT"
+            result["size_multiplier"] = 0
+
+        return result
+
+CONSENSUS = ConsensusEngine()
+
+# ==============================================================================
+# DYNAMIC POSITION SIZING
+# ==============================================================================
+def dynamic_size(base_margin, consensus_score, confidence):
+    """Higher consensus/confidence = larger size, lower = smaller."""
+    factor = 1.0
+    if consensus_score >= 95:
+        factor = 1.2
+    elif consensus_score >= 85:
+        factor = 1.0
+    elif consensus_score >= 75:
+        factor = 0.7
+    else:
+        factor = 0.5
+
+    if confidence < 50:
+        factor *= 0.7
+
+    return round(base_margin * factor, 2)
+
+# ==============================================================================
+# AI TRADE JOURNAL
+# ==============================================================================
+class AITradeJournal:
+    def __init__(self):
+        self.entries = []
+        self.feature_stats = {}
+
+    def log_trade(self, trade_data):
+        """Log complete trade with features for self-optimization."""
+        entry = {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "symbol": trade_data.get("symbol"),
+            "direction": trade_data.get("direction"),
+            "godmode_score": trade_data.get("godmode_score"),
+            "consensus_score": trade_data.get("consensus_score"),
+            "tier": trade_data.get("tier"),
+            "hermes_prob": trade_data.get("hermes_probability"),
+            "aegis_risk": trade_data.get("aegis_risk"),
+            "features": trade_data.get("features", {}),
+            "athena_regime": trade_data.get("athena_regime"),
+            "pnl_usdt": trade_data.get("pnl_usdt", 0),
+            "pnl_pct": trade_data.get("pnl_pct", 0),
+            "exit_reason": trade_data.get("exit_reason"),
+            "result": "WIN" if trade_data.get("pnl_usdt", 0) > 0 else "LOSS",
+        }
+        self.entries.append(entry)
+        self._update_feature_stats(entry)
+        return entry
+
+    def _update_feature_stats(self, entry):
+        """Track which features correlate with wins."""
+        features = entry.get("features", {})
+        result = entry.get("result", "LOSS")
+        for fname, fval in features.items():
+            if fname.startswith("_"):
+                continue
+            if fname not in self.feature_stats:
+                self.feature_stats[fname] = {"wins": [], "losses": [], "count": 0}
+            bucket = self.feature_stats[fname]
+            bucket["count"] += 1
+            if result == "WIN":
+                bucket["wins"].append(safe_float(fval))
+            else:
+                bucket["losses"].append(safe_float(fval))
+
+    def get_feature_importance(self):
+        """Return features sorted by win-correlation."""
+        importance = {}
+        for fname, stats in self.feature_stats.items():
+            if stats["count"] < 5:
+                continue
+            win_avg = np.mean(stats["wins"]) if stats["wins"] else 50
+            loss_avg = np.mean(stats["losses"]) if stats["losses"] else 50
+            importance[fname] = round(win_avg - loss_avg, 2)
+        return dict(sorted(importance.items(), key=lambda x: abs(x[1]), reverse=True))
+
+    def weekly_summary(self):
+        """Generate weekly summary for Telegram."""
+        if not self.entries:
+            return "No trades yet."
+        wins = [e for e in self.entries if e["result"] == "WIN"]
+        losses = [e for e in self.entries if e["result"] == "LOSS"]
+        total = len(self.entries)
+        pnl = sum(e.get("pnl_usdt", 0) for e in self.entries)
+        wr = len(wins) / total * 100 if total > 0 else 0
+
+        top_features = self.get_feature_importance()
+        top3 = list(top_features.items())[:3]
+
+        msg = (
+            f"📊 AI JOURNAL SUMMARY\n"
+            f"Total: {total} | W: {len(wins)} | L: {len(losses)}\n"
+            f"Win Rate: {wr:.1f}% | PnL: {pnl:+.3f} USDT\n"
+            f"Top Features: {', '.join(f'{k}({v:+.1f})' for k,v in top3)}"
+        )
+        return msg
+
+AI_JOURNAL = AITradeJournal()
+
+# ==============================================================================
+# MAIN ENTRY POINT: Full Pipeline Evaluation
+# ==============================================================================
+async def run_godmode_v2_pipeline(
+    symbol, df_5m, df_15m,
+    client_athena, model_athena,
+    client_hermes, model_hermes,
+    client_aegis, model_aegis,
+    base_margin=5.0,
+    market_ctx=None,
+    spread_bps=5.0,
+    ob_imbalance=1.0,
+):
+    """
+    Full GODMODE V2 pipeline.
+    Returns: {
+        "action": "LONG"|"SHORT"|"SKIP",
+        "score": float,
+        "tier": str,
+        "consensus": dict,
+        "features": dict,
+        "sizing": float,
+        "journal_entry": dict or None,
+    }
+    """
+    result = {
+        "action": "SKIP",
+        "score": 0,
+        "tier": "REJECT",
+        "consensus": {},
+        "features": {},
+        "sizing": 0,
+        "journal_entry": None,
+    }
+
+    # STAGE 0: Compute features
+    features = FEATURE_ENGINE.compute(df_5m, df_15m)
+    result["features"] = features
+
+    if not features or features.get("_price", 0) <= 0:
+        result["consensus"] = {"decision": "REJECT", "reason": "feature computation failed"}
+        return result
+
+    # STAGE 1: GodMode V2 Scoring (both directions)
+    direction, gm_score, gm_tier, breakdown = GM_SCORER.best_direction(features)
+    result["score"] = gm_score
+    result["tier"] = gm_tier
+
+    if direction == "NEUTRAL":
+        result["consensus"] = {"decision": "REJECT", "reason": "neutral - no edge"}
+        return result
+
+    if gm_score < TIER_THRESHOLDS["watch"]:
+        result["consensus"] = {"decision": "REJECT", "reason": f"score {gm_score} < {TIER_THRESHOLDS['watch']}"}
+        return result
+
+    # STAGE 2: ATHENA (cached, already running on timer)
+    athena_out = market_ctx or {
+        "market_regime": "CHOPPY", "bias": "NEUTRAL", "confidence": 30,
+    }
+
+    # STAGE 3: HERMES
+    hermes_out = await run_hermes(
+        client_hermes, model_hermes, symbol, direction, features, athena_out
+    )
+
+    hermes_score = safe_float(hermes_out.get("setup_score", 0))
+    hermes_conf = safe_float(hermes_out.get("confidence", 0))
+
+    if hermes_score < 40 or hermes_conf < 25:
+        result["consensus"] = {
+            "decision": "REJECT",
+            "reason": f"HERMES low: score={hermes_score} conf={hermes_conf}",
+        }
+        return result
+
+    # STAGE 4: AEGIS
+    aegis_out = await run_aegis(
+        client_aegis, model_aegis, symbol, direction, features,
+        athena_out, hermes_out, spread_bps, ob_imbalance
+    )
+
+    if not aegis_out.get("approve", False):
+        result["consensus"] = {
+            "decision": "REJECT",
+            "reason": "AEGIS VETO: " + "; ".join(aegis_out.get("rejection_reasons", [])[:2]),
+        }
+        AI_JOURNAL.log_trade({
+            "symbol": symbol, "direction": direction,
+            "godmode_score": gm_score, "consensus_score": 0,
+            "tier": gm_tier, "hermes_probability": hermes_out.get("probability_estimate", 0),
+            "aegis_risk": aegis_out.get("risk_score", 100),
+            "features": {k: v for k, v in features.items() if not k.startswith("_")},
+            "athena_regime": athena_out.get("market_regime", "?"),
+            "pnl_usdt": 0, "pnl_pct": 0, "exit_reason": "AEGIS_VETO",
+        })
+        return result
+
+    # STAGE 5: CONSENSUS
+    consensus = CONSENSUS.evaluate(gm_score, gm_tier, athena_out, hermes_out, aegis_out)
+    result["consensus"] = consensus
+    result["action"] = direction if consensus["decision"] in ("SNIPER", "EXECUTE") else "SKIP"
+
+    # STAGE 6: DYNAMIC SIZING
+    if result["action"] != "SKIP":
+        result["sizing"] = dynamic_size(
+            base_margin, consensus["consensus_score"], consensus.get("hermes_confidence", 50)
+        )
+
+    return result
